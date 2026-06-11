@@ -6,8 +6,6 @@ import glob
 import shutil
 import time
 import uuid
-
-# app2.py 所需的套件
 import librosa
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,10 +15,18 @@ import parselmouth
 import zipfile
 import itertools
 
+# pydub 與靜音偵測
+from pydub import AudioSegment
+from pydub.silence import split_on_silence
+import torch
+
+import psutil   # 新增：用於偵測 RAM 記憶體
+import gc
+
 # =========================================================
 # 【系統層級設定與 FFmpeg Shared DLL 強行注入】
 # =========================================================
-st.set_page_config(page_title="本地 AI 翻唱工作站", layout="wide")
+st.set_page_config(page_title="極致 AI 翻唱工作站", layout="wide")
 
 # 1. 【破解 Python 3.8+ 的 DLL 資安限制】
 shared_ffmpeg_path = glob.glob(r"C:\ffmpeg_shared\**\bin", recursive=True)
@@ -36,87 +42,233 @@ found_ffmpegs = glob.glob(winget_ffmpeg_pattern, recursive=True)
 if found_ffmpegs:
     os.environ["PATH"] = os.path.dirname(found_ffmpegs[0]) + os.path.pathsep + os.environ["PATH"]
 
-from pydub import AudioSegment
-import torch
-
 # =========================================================
 # 【app2.py 全域圖表設定與常數】
 # =========================================================
-# 解決日文與中文顯示環境（防止檔名變方塊）
 plt.rcParams['font.family'] = [
     'MS Gothic', 'Yu Gothic', 'Hiragino Sans', 
     'Noto Sans CJK JP', 'Microsoft JhengHei', 'Arial Unicode MS', 'sans-serif'
 ]
 plt.rcParams['axes.unicode_minus'] = False 
 
-# 設置 88 鍵鋼琴的 MIDI 範圍 (A0 到 C8)
 MIN_MIDI = 21
 MAX_MIDI = 108
 MIDI_KEYS = np.arange(MIN_MIDI, MAX_MIDI + 1)
-OUTLIER_THRESHOLD = 25  # 特定次數門檻：小於 25 幀 (0.25秒) 視為雜訊/異常值排除
+OUTLIER_THRESHOLD = 25 
 
 # =========================================================
 # 【通用終端機輸出擷取函數】
 # =========================================================
 def run_and_stream(cmd, cwd, log_box):
-    """執行指令並將輸出即時打到 Streamlit 的介面上，完美相容 Windows 亂碼"""
     process = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, 
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+        text=True, encoding="utf-8", errors="replace", bufsize=1
     )
-    
     log_text = ""
     for line in iter(process.stdout.readline, ''):
         log_text += line
         display_text = log_text[-2000:] if len(log_text) > 2000 else log_text
         log_box.code(display_text, language="text")
-        
     process.stdout.close()
-    return_code = process.wait()
-    return return_code
+    return process.wait()
 
 # =========================================================
-# 【核心防護罩：安全的 Demucs 執行函數】
+# 【資源管理：記憶體與 VRAM 監控告警】
 # =========================================================
-def run_demucs_safely(input_file_path, output_dir, model):
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    venv_python = os.path.join(current_dir, "venv", "Scripts", "python.exe")
-    if not os.path.exists(venv_python):
-        venv_python = sys.executable
+def check_and_warn_memory_usage():
+    """偵測 RAM 與 VRAM 佔用率，過高時在終端機發出紅字警告並嘗試回收垃圾"""
+    # 1. 檢查系統記憶體 (RAM)
+    ram_percent = psutil.virtual_memory().percent
+    if ram_percent > 85.0:
+        sys.stderr.write(f"\n\033[91m[🚨 警告] 系統記憶體 (RAM) 佔用率已達 {ram_percent}%！隨時可能崩潰！\033[0m\n")
+        gc.collect() # 強制回收未使用的 Python 記憶體
 
-    custom_env = os.environ.copy()
-    custom_env.pop("PYTHONPATH", None) 
-    custom_env.pop("PYTHONHOME", None)
-    venv_bin_dir = os.path.dirname(venv_python)
-    custom_env["PATH"] = f"{venv_bin_dir};{custom_env.get('PATH', '')}"
+    # 2. 檢查顯示卡記憶體 (VRAM)
+    if torch.cuda.is_available():
+        free_vram, total_vram = torch.cuda.mem_get_info()
+        vram_percent = ((total_vram - free_vram) / total_vram) * 100
+        if vram_percent > 85.0:
+            sys.stderr.write(f"\n\033[91m[🚨 警告] 5070 Ti 顯示記憶體 (VRAM) 佔用達 {vram_percent:.1f}%！可能導致 CUDA Out of Memory！\033[0m\n")
+            torch.cuda.empty_cache() # 強制清空 PyTorch 快取
+
+# 每次網頁刷新或按鈕觸發時，自動執行一次檢查
+check_and_warn_memory_usage()
+# =========================================================
+# 【AI 模型常數設定】
+# =========================================================
+MODEL_ROFORMER = "model_bs_roformer_ep_317_sdr_12.9755.ckpt" 
+MODEL_BVE = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"                      # 新增：和音消除專用模型
+MODEL_DEREVERB = "UVR-DeEcho-DeReverb.pth"      
+MODEL_DEMUCS = "htdemucs.yaml"
+
+# =========================================================
+# 【Tab 4 專用：Demucs 快速人聲分離】
+# =========================================================
+def run_demucs_fast(input_file_path, output_dir, task_id):
+    """
+    調用 HTDemucs 進行極速的 4 軌分離 (人聲/貝斯/鼓/其他)。
+    專注於速度，不求完美無瑕的音質，只求快速拿到可供音高分析的乾聲。
+    """
+    temp_dir = os.path.join(output_dir, f"demucs_{task_id}")
+    os.makedirs(temp_dir, exist_ok=True)
     
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    venv_scripts = os.path.join(current_dir, "venv", "Scripts")
+    audio_separator_exe = os.path.join(venv_scripts, "audio-separator.exe")
+    cli_cmd = audio_separator_exe if os.path.exists(audio_separator_exe) else "audio-separator"
+
     cmd = [
-        venv_python, "-m", "demucs", 
-        "-n", model, 
-        "--two-stems=vocals", 
-        "-o", output_dir, 
-        input_file_path
+        cli_cmd,
+        input_file_path,
+        "--model_filename", MODEL_DEMUCS,
+        "--output_dir", temp_dir,
+        "--output_format", "WAV",
+        "--single_stem", "Vocals", # 只輸出人聲軌，節省 I/O 時間
+        "--log_level", "INFO" 
     ]
-    result = subprocess.run(cmd, check=True, env=custom_env)
-    return result
+    
+    try:
+        subprocess.run(
+            cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+    except Exception as e:
+        raise Exception(f"Demucs 快速分離失敗: {e}")
+        
+    try:
+        # Demucs 輸出檔名通常會包含 "(Vocals)"
+        all_wavs = glob.glob(os.path.join(temp_dir, "*.wav"))
+        vocal_file = next((f for f in all_wavs if "(Vocals)" in f), all_wavs[0])
+        return vocal_file
+    except Exception:
+        raise Exception("Demucs 執行完畢，但找不到人聲輸出檔案。")
+
+def run_uvr5_safely(input_file_path, output_dir, model_name, task_id):
+    """
+    呼叫最強開源庫 audio-separator。
+    自動下載並調用指定的 BS-Roformer 或 VR 模型進行物理級提純。
+    """
+    temp_dir = os.path.join(output_dir, f"uvr5_{task_id}")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    venv_scripts = os.path.join(current_dir, "venv", "Scripts")
+    
+    # 修正 1：正確呼叫 audio-separator 的執行檔，而不是過時的 module 寫法
+    audio_separator_exe = os.path.join(venv_scripts, "audio-separator.exe")
+    if os.path.exists(audio_separator_exe):
+        cli_cmd = audio_separator_exe
+    else:
+        # 退回使用系統全域變數
+        cli_cmd = "audio-separator"
+
+    # 在 cmd 陣列中，加入強制使用 GPU 的參數
+    cmd = [
+        cli_cmd,
+        input_file_path,
+        "--model_filename", model_name,
+        "--output_dir", temp_dir,
+        "--output_format", "WAV",
+        # 👇 移除錯誤的參數，換成 DEBUG 模式來監控底層 GPU 呼叫狀態
+        "--log_level", "DEBUG"
+    ]
+    
+    try:
+        # 強制攔截標準輸出 (stdout) 與錯誤輸出 (stderr)
+        result = subprocess.run(
+            cmd, 
+            check=True, 
+            capture_output=True, 
+            text=True, 
+            encoding="utf-8", 
+            errors="replace"
+        )
+    except subprocess.CalledProcessError as e:
+        # 修正 2：確保發生崩潰時，印出所有可能的日誌
+        st.error(f"❌ audio-separator 執行崩潰 (退出碼 {e.returncode})！")
+        st.code(f"【錯誤日誌 STDERR】:\n{e.stderr}\n\n【標準輸出 STDOUT】:\n{e.stdout}", language="text")
+        raise Exception("底層分離引擎崩潰，無法生成檔案。")
+    except FileNotFoundError:
+        st.error("❌ 找不到 `audio-separator` 執行檔！請確認是否已啟動虛擬環境並安裝 `pip install audio-separator[gpu]`")
+        raise Exception("未安裝 audio-separator 套件。")
+    
+    # === 將原本尋找檔案的 try 區塊替換成這段 ===
+    # === 將原本尋找檔案的 try 區塊替換成這段 ===
+    try:
+        all_wavs = glob.glob(os.path.join(temp_dir, "*.wav"))
+        if len(all_wavs) < 2:
+            raise Exception("引擎未產出足夠的輸出檔案。")
+            
+        # 根據模型動態辨識後綴
+        if "DeReverb" in model_name:
+            vocal_file = next((f for f in all_wavs if "(No Reverb)" in f), all_wavs[0])
+            inst_file = next((f for f in all_wavs if "(Reverb)" in f and "(No Reverb)" not in f), all_wavs[1])
+            
+        elif "BVE" in model_name or "karaoke" in model_name.lower():
+            # BVE/Karaoke 模型在 audio-separator 預設輸出：(Vocals) 為主唱，(Instrumental) 為和音
+            backing = next((f for f in all_wavs if "(Backing)" in f or "(Secondary)" in f or "(Instrumental)" in f), None)
+            
+            if backing:
+                inst_file = backing
+                vocal_file = next((f for f in all_wavs if f != backing), all_wavs[0])
+            else:
+                # 防呆：確保不會因為字母排序 I (Instrumental) 在 V (Vocals) 前面導致主副反轉
+                all_wavs_sorted = sorted(all_wavs)
+                inst_file = next((f for f in all_wavs_sorted if "Inst" in f or "inst" in f), all_wavs_sorted[0])
+                vocal_file = next((f for f in all_wavs_sorted if f != inst_file), all_wavs_sorted[1])
+                
+        else:
+            # Roformer 階段
+            vocal_file = next((f for f in all_wavs if "(Vocals)" in f), all_wavs[0])
+            inst_file = next((f for f in all_wavs if "(Instrumental)" in f), all_wavs[1])
+            
+        return vocal_file, inst_file
+        
+    except Exception as e:
+        st.warning(f"⚠️ 檔案擷取失敗: {e}。完整日誌如下：")
+        st.code(f"【STDERR】:\n{result.stderr}\n\n【STDOUT】:\n{result.stdout}", language="text")
+        raise Exception("分離失敗：無法配對輸出檔案。")
+
+           
 
 # =========================================================
-# 【app2.py 核心分析函數】
+# 【全新：針對 RVC 優化的 VAD 靜音裁切引擎】
+# =========================================================
+def optimize_audio_for_rvc(input_path, output_path, min_silence_len=500, silence_thresh=-55):
+    """
+    精準裁切無聲底噪區段，並在人聲樂句之間補入標準的 0.5 秒絕對靜音。
+    這能確保 RVC 訓練時獲得最乾淨的特徵，同時不會因為檔案過度連續而爆顯存。
+    """
+    audio = AudioSegment.from_file(input_path)
+    
+    # 尋找所有有人聲的區塊
+    chunks = split_on_silence(
+        audio,
+        min_silence_len=min_silence_len,
+        silence_thresh=silence_thresh,
+        keep_silence=400 # 保留頭尾 200ms 的呼吸聲，讓語氣自然
+    )
+    
+    if not chunks:
+        # 防呆：如果判斷全為靜音，則原樣輸出
+        audio.export(output_path, format="wav")
+        return
+        
+    # 0.5 秒的純淨靜音分隔符 (為 RVC 的切片機製造完美斷點)
+    spacer = AudioSegment.silent(duration=500)
+    
+    processed_audio = chunks[0]
+    for chunk in chunks[1:]:
+        processed_audio += spacer + chunk
+        
+    processed_audio.export(output_path, format="wav")
+
+# =========================================================
+# 【音域分析函數 (Tab 4)】
 # =========================================================
 @st.cache_data(show_spinner=False)
 def extract_pitch_distribution_fast(file_bytes, file_name):
-    """
-    使用 parselmouth 提取基頻（高精確度 10ms 採樣）
-    """
     audio_io = io.BytesIO(file_bytes)
     y, sr = librosa.load(audio_io, sr=16000)
-    
     sound = parselmouth.Sound(y, sampling_frequency=sr)
     pitch = sound.to_pitch(time_step=0.01, pitch_floor=65.0, pitch_ceiling=2093.0)
     f0_voiced = pitch.selected_array['frequency']
@@ -130,9 +282,6 @@ def extract_pitch_distribution_fast(file_bytes, file_name):
     return counts
 
 def plot_piano_roll_distribution(counts, title):
-    """
-    繪製音域分佈圖與完美對齊的 88 鍵鋼琴鍵盤
-    """
     fig, (ax, ax_piano) = plt.subplots(
         2, 1, 
         figsize=(14, 6), 
@@ -158,10 +307,7 @@ def plot_piano_roll_distribution(counts, title):
     ax_piano.set_xlim(MIN_MIDI - 1, MAX_MIDI + 1)
     ax_piano.set_ylim(0, 1)
     
-    rect_base = plt.Rectangle(
-        (MIN_MIDI - 0.5, 0), MAX_MIDI - MIN_MIDI + 1, 1, 
-        facecolor='white', edgecolor='black', linewidth=0.8, zorder=1
-    )
+    rect_base = plt.Rectangle((MIN_MIDI - 0.5, 0), MAX_MIDI - MIN_MIDI + 1, 1, facecolor='white', edgecolor='black', linewidth=0.8, zorder=1)
     ax_piano.add_patch(rect_base)
     
     for midi in range(MIN_MIDI, MAX_MIDI):
@@ -172,10 +318,7 @@ def plot_piano_roll_distribution(counts, title):
             
     for midi in MIDI_KEYS:
         if midi % 12 in [1, 3, 6, 8, 10]:
-            rect_black = plt.Rectangle(
-                (midi - 0.4, 0.35), 0.8, 0.65, 
-                facecolor='#1a1a1a', edgecolor='black', linewidth=0.5, zorder=10
-            )
+            rect_black = plt.Rectangle((midi - 0.4, 0.35), 0.8, 0.65, facecolor='#1a1a1a', edgecolor='black', linewidth=0.5, zorder=10)
             ax_piano.add_patch(rect_black)
             
     c_notes_midi = [24, 36, 48, 60, 72, 84, 96, 108] 
@@ -198,23 +341,35 @@ def plot_piano_roll_distribution(counts, title):
     return fig
 
 # =========================================================
-# 【初始化與介面配置】
+# 【目錄初始化與狀態鎖 (含網頁刷新自動清理機制)】
 # =========================================================
 UPLOAD_DIR = "temp_audio"
 TOOL_DIR = "temp_toolkit"
-
-# 全局綁定 2024 新版 RVC 路徑
 RVC_FULL_DIR = r"C:\Users\User\Desktop\Work\RVC20240604Nvidia50x0"
 
 for d in [UPLOAD_DIR, TOOL_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# --- 狀態鎖與歷史紀錄初始化 ---
+# 💡 新增：網頁剛開啟或刷新 (F5) 時，清空所有輸入輸出暫存檔
+if 'init_cleanup' not in st.session_state:
+    st.session_state.init_cleanup = True
+    
+    # 清理 Page 1 & Page 4 的暫存音訊 (不包含 RVC 訓練資料)
+    for f in glob.glob(os.path.join(UPLOAD_DIR, "*")):
+        try: os.remove(f) if os.path.isfile(f) else shutil.rmtree(f)
+        except Exception: pass
+        
+    # 清理 Page 3 的分離暫存與 ZIP 包
+    for f in glob.glob(os.path.join(TOOL_DIR, "*")):
+        try: os.remove(f) if os.path.isfile(f) else shutil.rmtree(f)
+        except Exception: pass
+        
+    sys.stderr.write("\n\033[93m[🔄 系統] 網頁已刷新，已自動清空 temp_audio 與 temp_toolkit 暫存資料夾以釋放空間。\033[0m\n")
+
 if 'step1' not in st.session_state: st.session_state.step1 = False
 if 'step2' not in st.session_state: st.session_state.step2 = False
 if 'step3' not in st.session_state: st.session_state.step3 = False
 if 'step4_preview' not in st.session_state: st.session_state.step4_preview = False
-
 if 'history' not in st.session_state: st.session_state.history = []
 if 'current_filename' not in st.session_state: st.session_state.current_filename = ""
 if 'uid' not in st.session_state: st.session_state.uid = ""
@@ -224,37 +379,27 @@ with st.sidebar:
     st.header("💻 系統硬體狀態")
     if torch.cuda.is_available():
         st.success(f"GPU 已就緒: {torch.cuda.get_device_name(0)}")
-        st.caption("CUDA 加速已啟用 (支援 Blackwell 架構)")
     else:
         st.error("未偵測到 NVIDIA GPU，將使用 CPU 處理。")
-    
     st.markdown("---")
     st.markdown("### 當前推論進度")
     st.checkbox("1. 檔案上傳", value=st.session_state.step1, disabled=True)
     st.checkbox("2. 人聲分離", value=st.session_state.step2, disabled=True)
     st.checkbox("3. 音色轉換", value=st.session_state.step3, disabled=True)
 
-# 加入了 Tab 4 (音域分析可視化)
-tab1, tab2, tab3, tab4 = st.tabs(["🎙️ 日常翻唱工作站 (推論)", "⚙️ 建立新音色 (模型訓練)", "✂️ 訓練素材提取 (工具箱)", "📊 音域分析可視化"])
+tab1, tab2, tab3, tab4 = st.tabs(["🎙️ 日常翻唱工作站", "⚙️ 建立新音色", "✂️ 訓練素材提取", "📊 音域分析可視化"])
 
 # ==========================================
-# 分頁 1：日常翻唱工作站 (Inference Pipeline)
+# 分頁 1：日常翻唱工作站
 # ==========================================
 with tab1:
-    st.title("🎙️ AI 歌聲轉換管線")
-    model_choice = st.selectbox(
-        "選擇分離模型",
-        options=["htdemucs", "mdx_extra_q"],
-        index=0,
-        help="htdemucs 是新版 Transformer 模型，mdx_extra_q 則是經典模型，若覺得效果不佳可嘗試切換。"
-    )
-    uploaded_file = st.file_uploader("1. 上傳目標歌曲 (MP3/WAV)", type=["mp3", "wav"])
+    st.title("🎙️ AI 歌聲轉換管線 (UVR5 極致版)")
+    uploaded_file = st.file_uploader("1. 上傳目標歌曲 (MP3/WAV/FLAC)", type=["mp3", "wav", "flac"])
     
     if uploaded_file is not None:
-        # 【核心防覆蓋機制】：偵測到新檔案，立即派發全新 UUID 並重置進度
         if uploaded_file.name != st.session_state.current_filename:
             st.session_state.current_filename = uploaded_file.name
-            st.session_state.uid = uuid.uuid4().hex[:8] # 產生 8 碼隨機 ID
+            st.session_state.uid = uuid.uuid4().hex[:8] 
             st.session_state.step1 = True
             st.session_state.step2 = False
             st.session_state.step3 = False
@@ -264,39 +409,56 @@ with tab1:
         uid = st.session_state.uid
         file_ext = os.path.splitext(uploaded_file.name)[1]
         original_name = os.path.splitext(uploaded_file.name)[0]
-        safe_basename = f"cover_{uid}" # 每一首歌的專屬資料夾名稱
+        safe_basename = f"cover_{uid}" 
         file_path = os.path.join(UPLOAD_DIR, f"{safe_basename}{file_ext}")
         
-        # 寫入上傳的檔案
         if not os.path.exists(file_path):
             with open(file_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
             
         st.markdown("---")
-        st.subheader(f"2. 人聲分離 (Demucs) - 當前處理: `{original_name}`")
+        st.subheader(f"2. 極限人聲分離與 AI 去混響 (UVR5) - 當前處理: `{original_name}`")
         
-        vocals_path = os.path.join(UPLOAD_DIR, "htdemucs", safe_basename, "vocals.wav")
-        inst_path = os.path.join(UPLOAD_DIR, "htdemucs", safe_basename, "no_vocals.wav")
+        # 定義多出來的和音路徑
+        inst_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Instrumental.wav")
+        vocals_backing_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Vocals_Backing.wav") # 新增和音軌
+        vocals_wet_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Vocals_Wet.wav")
+        vocals_dry_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Vocals_Dry.wav")
+        vocals_effects_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Vocals_Reverb.wav")
         
         if not st.session_state.step2:
-            if st.button("啟動 GPU 人聲分離", type="primary", key="infer_demucs_btn"):
-                with st.spinner("正在調用 5070 Ti 剔除背景樂器，請看終端機進度條..."):
+            if st.button("🚀 啟動 5070 Ti 頂級分離管線 (Roformer + BVE + DeReverb)", type="primary", key="infer_uvr5_btn"):
+                with st.spinner("1/3 正在調用 BS-Roformer 剔除背景樂器..."):
                     try:
-                        run_demucs_safely(file_path, UPLOAD_DIR, "mdx_extra_q")
+                        v_wet, inst = run_uvr5_safely(file_path, UPLOAD_DIR, MODEL_ROFORMER, f"{uid}_step1")
+                        shutil.copy(inst, inst_path)
+                        
+                        with st.spinner("2/3 正在調用 BVE 模型剝離並保留原曲和音 (Backing Vocals)..."):
+                            v_lead_wet, v_backing = run_uvr5_safely(v_wet, UPLOAD_DIR, MODEL_BVE, f"{uid}_step1b")
+                            shutil.copy(v_backing, vocals_backing_path)
+                        
+                        with st.spinner("3/3 正在調用 DeReverb 模型進行 AI 極限乾濕分離..."):
+                            v_dry, v_fx = run_uvr5_safely(v_lead_wet, UPLOAD_DIR, MODEL_DEREVERB, f"{uid}_step2")
+                            shutil.copy(v_dry, vocals_dry_path)
+                            shutil.copy(v_fx, vocals_effects_path)
+                            
                         st.session_state.step2 = True
                         st.rerun()
-                    except subprocess.CalledProcessError:
-                        st.error("❌ Demucs 執行失敗！請檢查終端機報錯。")
+                    except Exception as e:
+                        st.error(f"❌ UVR5 管線執行失敗：{e}")
                         st.stop()
 
-        if st.session_state.step2 and os.path.exists(vocals_path):
-            st.success("✅ 分離完成！")
-            col_v, col_i = st.columns(2)
-            with col_v:
-                st.caption("純人聲 (待轉換)")
-                st.audio(vocals_path)
-            with col_i:
-                st.caption("純伴奏 (待合成)")
+        if st.session_state.step2 and os.path.exists(vocals_dry_path):
+            st.success("✅ UVR5 極限分離與環境特徵提取完成！")
+            col_1, col_2, col_3 = st.columns(3)
+            with col_1:
+                st.caption("🎙️ 極限乾聲 (餵給 AI 推理)")
+                st.audio(vocals_dry_path)
+            with col_2:
+                st.caption("🌌 原曲環境特徵 (純混響與和聲)")
+                st.audio(vocals_effects_path)
+            with col_3:
+                st.caption("🎸 純伴奏")
                 st.audio(inst_path)
             
             st.markdown("---")
@@ -310,28 +472,27 @@ with tab1:
                 st.warning(f"⚠️ 尚未偵測到模型！請確認檔案已放入: {rvc_weights_dir}")
             else:
                 selected_model = st.selectbox("選擇你的音色模型", available_models)
-                pitch_shift = st.slider("人聲升降調 (Pitch Shift)", -12, 12, 0, 1, help="男轉女建議 +12。注意：如果這裡調了 +4，下方的伴奏也必須調 +4，否則會走音！")
+                pitch_shift = st.slider("人聲升降調 (Pitch Shift)", -12, 12, 0, 1)
                 
                 if not st.session_state.step3:
                     if st.button("🚀 開始執行轉換"):
-                        st.info(f"正在喚醒 5070 Ti，載入模型：{selected_model} ...")
+                        st.info(f"正在載入模型：{selected_model} ...")
                         log_box = st.empty() 
                         
-                        abs_vocals = os.path.abspath(vocals_path)
+                        abs_vocals_dry = os.path.abspath(vocals_dry_path)
                         abs_output = os.path.abspath(output_vocal_path)
                         
                         rvc_python = os.path.join(RVC_FULL_DIR, "runtime", "python.exe")
                         rvc_script = os.path.join(RVC_FULL_DIR, "tools", "infer_cli.py")
                         
                         model_basename = os.path.splitext(selected_model)[0]
-                        index_search_pattern = os.path.join(RVC_FULL_DIR, "logs", model_basename, "added_*.index")
-                        found_indexes = glob.glob(index_search_pattern)
+                        found_indexes = glob.glob(os.path.join(RVC_FULL_DIR, "logs", model_basename, "added_*.index"))
                         index_path = found_indexes[0] if found_indexes else ""
 
                         cmd = [
                             rvc_python, rvc_script,
                             "--f0up_key", str(pitch_shift),
-                            "--input_path", abs_vocals,
+                            "--input_path", abs_vocals_dry,
                             "--opt_path", abs_output,
                             "--model_name", selected_model,
                             "--f0method", "rmvpe",
@@ -340,9 +501,8 @@ with tab1:
                         ]
                         
                         try:
-                            return_code = run_and_stream(cmd, RVC_FULL_DIR, log_box)
-                            if return_code != 0:
-                                st.error("❌ RVC 引擎推理失敗！請查看上方日誌。")
+                            if run_and_stream(cmd, RVC_FULL_DIR, log_box) != 0:
+                                st.error("❌ RVC 推理失敗！")
                             else:
                                 st.session_state.step3 = True
                                 st.rerun()
@@ -351,72 +511,88 @@ with tab1:
 
             if st.session_state.step3 and os.path.exists(output_vocal_path):
                 st.markdown("---")
-                st.subheader("4. 伴奏同步與混音微調 (預覽模式)")
-                st.info("💡 提示：伴奏的升降調已經自動對齊你剛才在步驟 3 設定的人聲數值，確保絕對不會走音！")
+                st.subheader("📊 AI 咬字與音高對齊精準度分析")
+                with st.spinner("正在繪製聲學特徵曲線對比圖..."):
+                    snd_orig = parselmouth.Sound(vocals_dry_path)
+                    snd_ai = parselmouth.Sound(output_vocal_path)
+                    
+                    pitch_orig = snd_orig.to_pitch(time_step=0.01)
+                    pitch_ai = snd_ai.to_pitch(time_step=0.01)
+                    
+                    f0_orig = pitch_orig.selected_array['frequency']
+                    f0_ai = pitch_ai.selected_array['frequency']
+                    
+                    f0_orig[f0_orig == 0] = np.nan
+                    f0_ai[f0_ai == 0] = np.nan
+                    
+                    fig_pitch, ax_pitch = plt.subplots(figsize=(14, 4))
+                    ax_pitch.plot(pitch_orig.xs(), f0_orig, label="原曲極限乾聲 (Target)", color='gray', alpha=0.5, linewidth=3)
+                    
+                    shift_hz_ratio = 2 ** (pitch_shift / 12)
+                    adjusted_f0_ai = f0_ai / shift_hz_ratio
+                    
+                    ax_pitch.plot(pitch_ai.xs(), adjusted_f0_ai, label="AI 推理人聲 (Inferred)", color='darkorange', alpha=0.9, linewidth=1.5)
+                    
+                    ax_pitch.set_title("Vocal Pitch Tracking: Original vs AI Inferred", fontsize=12)
+                    ax_pitch.set_xlabel("Time (Seconds)", fontsize=10)
+                    ax_pitch.set_ylabel("Frequency (Hz)", fontsize=10)
+                    ax_pitch.legend(loc="upper right")
+                    ax_pitch.grid(True, linestyle='--', alpha=0.3)
+                    
+                    st.pyplot(fig_pitch)
+                    plt.close(fig_pitch)
+
+                st.markdown("---")
+                st.subheader("4. 多軌特徵混音微調 (專業四軌預覽)")
                 
-                col_v_vol, col_i_vol, col_i_pitch = st.columns(3)
-                with col_v_vol: vocal_volume = st.slider("人聲音量 (dB)", -15.0, 15.0, 0.0, 1.0, key=f"v_vol_{uid}")
+                # 擴展為 5 個控制項
+                col_v_vol, col_i_vol, col_b_vol, col_e_vol, col_i_pitch = st.columns(5)
+                with col_v_vol: vocal_volume = st.slider("AI 乾聲音量 (dB)", -15.0, 15.0, 0.0, 1.0, key=f"v_vol_{uid}")
                 with col_i_vol: inst_volume = st.slider("伴奏音量 (dB)", -15.0, 15.0, 0.0, 1.0, key=f"i_vol_{uid}")
+                with col_b_vol: backing_volume = st.slider("和聲音量 (dB)", -15.0, 15.0, -1.0, 1.0, key=f"b_vol_{uid}")
+                with col_e_vol: effects_volume = st.slider("殘響特徵音量 (dB)", -20.0, 10.0, -2.0, 1.0, key=f"e_vol_{uid}")
+                with col_i_pitch: inst_pitch = st.slider("伴奏/和音升降調", -12, 12, value=pitch_shift, step=1, key=f"i_pitch_{uid}")
                 
-                # 【優化】：讓伴奏升降調的預設值，直接等於你在步驟 3 設定的 pitch_shift！
-                with col_i_pitch: inst_pitch = st.slider("伴奏升降調 (半音)", -12, 12, value=pitch_shift, step=1, key=f"i_pitch_{uid}")
-                
-                # 暫存的預覽檔案路徑
                 temp_preview_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_preview.wav")
                 
-                if st.button("🎧 產生預覽試聽", type="secondary"):
-                    with st.spinner("正在處理音軌與混音（若有調整伴奏 Key，需要約 10-20 秒進行立體聲重構）..."):
+                if st.button("🎧 產生多軌特徵混音預覽", type="secondary"):
+                    with st.spinner("正在處理音軌立體聲重構與多層特徵疊加..."):
                         current_inst_path = inst_path
+                        current_backing_path = vocals_backing_path
                         
-                        # 【核心修正】：強化的立體聲無損變調演算法
+                        # 伴奏與和音必須同時升降調，否則和弦會打架
                         if inst_pitch != 0:
-                            shifted_inst_path = os.path.join(UPLOAD_DIR, "htdemucs", safe_basename, f"no_vocals_shifted_{inst_pitch}.wav")
-                            if not os.path.exists(shifted_inst_path):
-                                shift_script = os.path.join(TOOL_DIR, "shift_pitch.py")
-                                # 寫入支援雙聲道 (Stereo) 的進階 librosa 腳本
-                                with open(shift_script, "w", encoding="utf-8") as f:
-                                    f.write("""
-import sys
-import numpy as np
-import soundfile as sf
-import librosa
-
-input_file = sys.argv[1]
-output_file = sys.argv[2]
-n_steps = float(sys.argv[3])
-
-# mono=False 確保讀取雙聲道立體聲
-y, sr = librosa.load(input_file, sr=None, mono=False)
-
-if y.ndim > 1:
-    # 針對左右聲道分別進行變調，維持立體聲環繞感
-    shifted_channels = []
-    for i in range(y.shape[0]):
-        shifted_channels.append(librosa.effects.pitch_shift(y[i], sr=sr, n_steps=n_steps))
-    y_shifted = np.array(shifted_channels).T
-else:
-    # 單聲道防呆
-    y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
-    y_shifted = y_shifted.reshape(-1, 1)
-
-# 寫入新檔案
-sf.write(output_file, y_shifted, sr)
-                                    """)
-                                
-                                # 調用 RVC 環境裡的 Python 執行變調
-                                rvc_python = os.path.join(RVC_FULL_DIR, "runtime", "python.exe")
-                                try:
-                                    subprocess.run([rvc_python, shift_script, inst_path, shifted_inst_path, str(inst_pitch)], check=True)
-                                except Exception as e:
-                                    st.error(f"❌ 伴奏變調失敗，請確認 RVC 環境是否安裝完整。錯誤訊息：{e}")
-                                    st.stop()
+                            shifted_inst_path = os.path.join(UPLOAD_DIR, f"shifted_inst_{uid}.wav")
+                            shifted_backing_path = os.path.join(UPLOAD_DIR, f"shifted_backing_{uid}.wav")
                             
+                            shift_script = os.path.join(TOOL_DIR, "shift_pitch.py")
+                            if not os.path.exists(shift_script):
+                                with open(shift_script, "w", encoding="utf-8") as f:
+                                    f.write("""import sys, numpy as np, soundfile as sf, librosa\ninput_file, output_file, n_steps = sys.argv[1], sys.argv[2], float(sys.argv[3])\ny, sr = librosa.load(input_file, sr=None, mono=False)\nif y.ndim > 1:\n    y_shifted = np.array([librosa.effects.pitch_shift(y[i], sr=sr, n_steps=n_steps) for i in range(y.shape[0])]).T\nelse:\n    y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps).reshape(-1, 1)\nsf.write(output_file, y_shifted, sr)""")
+                            
+                            rvc_python = os.path.join(RVC_FULL_DIR, "runtime", "python.exe")
+                            
+                            # 變調伴奏
+                            if not os.path.exists(shifted_inst_path):
+                                subprocess.run([rvc_python, shift_script, inst_path, shifted_inst_path, str(inst_pitch)], check=True)
                             current_inst_path = shifted_inst_path
+                            
+                            # 變調和音
+                            if not os.path.exists(shifted_backing_path):
+                                subprocess.run([rvc_python, shift_script, vocals_backing_path, shifted_backing_path, str(inst_pitch)], check=True)
+                            current_backing_path = shifted_backing_path
                         
-                        # 混音疊加
+                        # 組合四軌音訊
                         inst_audio = AudioSegment.from_file(current_inst_path) + inst_volume
+                        backing_audio = AudioSegment.from_file(current_backing_path) + backing_volume
                         vocal_audio = AudioSegment.from_file(output_vocal_path) + vocal_volume
-                        final_audio = inst_audio.overlay(vocal_audio)
+                        effects_audio = AudioSegment.from_file(vocals_effects_path) + effects_volume
+                        
+                        # 疊加輸出 (乾聲 + 殘響 + 和聲 + 伴奏)
+                        final_vocal = vocal_audio.overlay(effects_audio)
+                        final_inst = inst_audio.overlay(backing_audio)
+                        final_audio = final_inst.overlay(final_vocal)
+                        
                         final_audio.export(temp_preview_path, format="wav")
                         
                         st.session_state.step4_preview = True
@@ -424,42 +600,22 @@ sf.write(output_file, y_shifted, sr)
                         st.rerun()
 
                 if st.session_state.step4_preview and os.path.exists(st.session_state.preview_path):
-                    st.success("✅ 預覽音訊已產生！如果還是有電流音或走音，可以調整上方滑桿重新預覽。")
+                    st.success("✅ 預覽音訊已產生！")
                     st.audio(st.session_state.preview_path)
                     
-                    if st.button("💾 確認滿意，合併並存入歷史紀錄", type="primary"):
-                        # 將最終滿意的版本搬移到暫存資料夾
+                    if st.button("💾 合併並存入歷史紀錄", type="primary"):
                         final_mix_path = os.path.join(UPLOAD_DIR, f"{original_name}_AI_{uid}.wav")
                         shutil.copy(st.session_state.preview_path, final_mix_path)
                         
-                        # 寫入歷史紀錄陣列
-                        history_item = {
-                            "title": f"{original_name} (Vol: V{vocal_volume}/I{inst_volume}, Inst Pitch: {inst_pitch})",
-                            "path": final_mix_path,
-                            "id": uid
-                        }
-                        
-                        # 防止重複寫入
+                        history_item = {"title": f"{original_name} (Vol: V{vocal_volume}/I{inst_volume})", "path": final_mix_path, "id": uid}
                         if not any(item['id'] == uid for item in st.session_state.history):
                             st.session_state.history.append(history_item)
-                        else:
-                            for item in st.session_state.history:
-                                if item['id'] == uid:
-                                    item['title'] = history_item['title']
-                                    item['path'] = history_item['path']
-                                    
-                        st.success("🎉 已儲存！請至下方歷史紀錄庫查看。現在可以直接上傳下一首歌了！")
+                        st.success("🎉 已儲存！")
                         st.balloons()
 
-    # ==========================================
-    # 【新增】：歷史翻唱紀錄庫 (顯示於 Tab 1 底部)
-    # ==========================================
     if st.session_state.history:
         st.markdown("---")
         st.header("📚 歷史翻唱紀錄庫")
-        st.caption("此階段完成的所有作品都會保存在這裡。你可以直接上傳新歌，這裡的紀錄不會消失。")
-        
-        # 使用 reversed 讓最新製作的歌排在最上面
         for i, record in enumerate(reversed(st.session_state.history)):
             with st.container():
                 col1, col2 = st.columns([3, 1])
@@ -469,88 +625,45 @@ sf.write(output_file, y_shifted, sr)
                 with col2:
                     st.markdown("<br>", unsafe_allow_html=True)
                     with open(record['path'], "rb") as f:
-                        st.download_button(
-                            label="⬇️ 點此下載", 
-                            data=f, 
-                            file_name=f"{record['title']}.wav", 
-                            mime="audio/wav", 
-                            key=f"dl_history_{record['id']}",
-                            use_container_width=True
-                        )
+                        st.download_button("⬇️ 下載", f, f"{record['title']}.wav", "audio/wav", key=f"dl_{record['id']}", use_container_width=True)
             st.divider()
 
 # ==========================================
 # 分頁 2：建立新音色 (Local Training Pipeline)
 # ==========================================
 with tab2:
-    st.title("⚙️ 本機 AI 聲音模型訓練 (RTX 50 系列優化版)")
-    st.markdown("將音檔交給底層 RVC 引擎，系統將自動定位腳本並調用 5070 Ti 進行加速訓練。")
-    
-    # 確保訓練狀態鎖初始化
+    st.title("⚙️ 本機 AI 聲音模型訓練")
     if "is_training" not in st.session_state:
         st.session_state.is_training = False
         
-    # 指向你的 2024 新版 Nvidia50x0 資料夾
-    RVC_FULL_DIR = r"C:\Users\User\Desktop\Work\RVC20240604Nvidia50x0" 
     CURRENT_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
     
-    # 當正在訓練時，鎖定輸入介面
-    new_model_name = st.text_input(
-        "1. 為新模型命名 (英文/數字)", 
-        disabled=st.session_state.is_training,
-        placeholder="例如: Akane_v1_5070"
-    )
-    dataset_files = st.file_uploader(
-        "2. 上傳乾淨人聲 (WAV)", 
-        accept_multiple_files=True, 
-        type=['wav'],
-        disabled=st.session_state.is_training
-    )
+    new_model_name = st.text_input("1. 為新模型命名 (英文/數字)", disabled=st.session_state.is_training)
+    dataset_files = st.file_uploader("2. 上傳乾淨人聲 (WAV)", accept_multiple_files=True, type=['wav'], disabled=st.session_state.is_training)
+    total_epochs = st.slider("3. 訓練輪數 (Total Epochs)", 10, 300, 100, 10, disabled=st.session_state.is_training)
     
-    total_epochs = st.slider(
-        "3. 訓練輪數 (Total Epochs)", 
-        min_value=10, 
-        max_value=300, 
-        value=100, 
-        step=10,
-        disabled=st.session_state.is_training
-    )
-    
-    # 根據訓練狀態動態更換按鈕
     if st.session_state.is_training:
-        st.button("🔥 5070 Ti 正在全速深層學習中，請勿重新整理網頁...", type="secondary", disabled=True)
+        st.button("🔥 正在全速深層學習中，請勿重新整理網頁...", type="secondary", disabled=True)
     else:
         start_train_btn = st.button("🚀 啟動全自動訓練", type="primary")
         
-    # 正式進入訓練觸發邏輯
-    if not st.session_state.is_training and 'start_train_btn' in locals() and start_train_btn:
-        if not new_model_name or not dataset_files:
+    if not st.session_state.is_training and start_train_btn:
+        if not new_model_name or not dataset_files: 
             st.error("請填寫模型名稱並上傳音檔！")
-        elif not os.path.exists(RVC_FULL_DIR):
-            st.error(f"找不到 RVC 核心資料夾，請檢查路徑：\n`{RVC_FULL_DIR}`")
         else:
             st.session_state.is_training = True
             st.rerun()
 
-    # 當狀態鎖被激活時，執行後端自動化管線
     if st.session_state.is_training:
-        st.info("🔍 正在初始化全自動訓練管線...")
-        
         status_text = st.empty()
         log_box = st.empty() 
         
-        # ---------------------------------------------------------
-        # 【全自動腳本定位導航系統】
-        # ---------------------------------------------------------
         def find_rvc_script(target_names):
-            """在 RVC 資料夾中遞迴搜尋符合名稱的腳本，相容新舊版本目錄架構"""
             for name in target_names:
                 match = glob.glob(os.path.join(RVC_FULL_DIR, "**", name), recursive=True)
-                if match:
-                    return match[0]
+                if match: return match[0]
             return None
 
-        # 將 2024 版的新檔名加入優先搜尋前排
         script_preprocess = find_rvc_script(["preprocess.py", "trainset_preprocess_pipeline_print.py"])
         script_extract_f0 = find_rvc_script(["extract_f0_print.py", "extract_f0_rmvpe.py", "extract_f0.py"])
         script_extract_feat = find_rvc_script(["extract_feature_print.py", "extract_feature.py"])
@@ -558,17 +671,14 @@ with tab2:
 
         if not all([script_preprocess, script_extract_f0, script_extract_feat, script_train]):
             st.session_state.is_training = False
-            st.error("❌ 核心腳本定位失敗！某些組件未在 RVC 目錄中找到。")
+            st.error("❌ 核心腳本定位失敗！")
             st.button("重試並解除鎖定")
         else:
             rvc_dataset_rel = f"dataset/{new_model_name}"
             rvc_logs_rel = f"logs/{new_model_name}"
-            
-            # 建立工作資料夾
             os.makedirs(os.path.join(RVC_FULL_DIR, rvc_dataset_rel), exist_ok=True)
             os.makedirs(os.path.join(RVC_FULL_DIR, rvc_logs_rel), exist_ok=True)
             
-            # 寫入 WAV 檔案
             for f in dataset_files:
                 with open(os.path.join(RVC_FULL_DIR, rvc_dataset_rel, f.name), "wb") as out_f:
                     out_f.write(f.getbuffer())
@@ -576,195 +686,208 @@ with tab2:
             rvc_python = os.path.join(RVC_FULL_DIR, "runtime", "python.exe")
                     
             try:
-                # --- 步驟 A：處理資料集 ---
-                status_text.markdown("### ⏳ 步驟 1/3：處理音頻切片...")
-                cmd_preprocess = [rvc_python, script_preprocess, rvc_dataset_rel, "40000", "8", rvc_logs_rel, "False", "3.0"]
-                if run_and_stream(cmd_preprocess, RVC_FULL_DIR, log_box) != 0: raise Exception("音頻切片失敗")
+                # ==========================================
+                # 💡 全局採樣率 (Sample Rate) 統一偵測區塊
+                # ==========================================
+                possible_paths = [
+                    os.path.join(RVC_FULL_DIR, "configs", "48k.json"),
+                    os.path.join(RVC_FULL_DIR, "configs", "v2", "48k.json"),
+                    os.path.join(RVC_FULL_DIR, "configs", "40k.json"),
+                    os.path.join(RVC_FULL_DIR, "configs", "v2", "40k.json"),
+                    os.path.join(RVC_FULL_DIR, "configs", "32k.json"),
+                    os.path.join(RVC_FULL_DIR, "configs", "v2", "32k.json")
+                ]
                 
-                # --- 步驟 B：提取特徵 ---
+                config_template_path = None
+                chosen_sample_rate = "40k" # 預設值
+                
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        config_template_path = path
+                        if "48k" in path: chosen_sample_rate = "48k"
+                        elif "32k" in path: chosen_sample_rate = "32k"
+                        elif "40k" in path: chosen_sample_rate = "40k"
+                        break
+                        
+                if not config_template_path:
+                    available_configs = os.listdir(os.path.join(RVC_FULL_DIR, "configs")) if os.path.exists(os.path.join(RVC_FULL_DIR, "configs")) else []
+                    raise FileNotFoundError(f"❌ 找不到 RVC 訓練設定範本！當前 configs 資料夾內包含: {available_configs}")
+
+                # 對應數字採樣率給 preprocess 使用
+                sr_numeric_map = {"48k": "48000", "40k": "40000", "32k": "32000"}
+                preprocess_sr = sr_numeric_map[chosen_sample_rate]
+                
+                st.info(f"ℹ️ 已自動匹配本機 RVC 設定檔範本: {os.path.basename(config_template_path)} (採用全局 {chosen_sample_rate} 規格)")
+
+                # ==========================================
+                # 開始執行三步驟管線
+                # ==========================================
+                status_text.markdown(f"### ⏳ 步驟 1/3：處理音頻切片 (目標採樣率: {preprocess_sr} Hz)...")
+                if run_and_stream([rvc_python, script_preprocess, rvc_dataset_rel, preprocess_sr, "8", rvc_logs_rel, "False", "3.0"], RVC_FULL_DIR, log_box) != 0: 
+                    raise Exception("音頻切片失敗")
+                
                 status_text.markdown("### ⏳ 步驟 2/3：提取神經網路特徵 (Hubert & RMVPE)...")
-                cmd_extract_f0 = [rvc_python, script_extract_f0, rvc_logs_rel, "8", "rmvpe"]
-                if run_and_stream(cmd_extract_f0, RVC_FULL_DIR, log_box) != 0: raise Exception("F0音高提取失敗")
+                if run_and_stream([rvc_python, script_extract_f0, rvc_logs_rel, "8", "rmvpe"], RVC_FULL_DIR, log_box) != 0: 
+                    raise Exception("F0提取失敗")
+                if run_and_stream([rvc_python, script_extract_feat, "cuda:0", "1", "0", "0", rvc_logs_rel, "v2", "True"], RVC_FULL_DIR, log_box) != 0: 
+                    raise Exception("特徵提取失敗")
                 
-                cmd_extract_feature = [rvc_python, script_extract_feat, "cuda:0", "1", "0", "0", rvc_logs_rel, "v2", "True"]
-                if run_and_stream(cmd_extract_feature, RVC_FULL_DIR, log_box) != 0: raise Exception("特徵向量提取失敗")
-                
-                # --- 【核心必殺技：模擬原廠 WebUI 自動生成 filelist.txt】 ---
                 status_text.markdown("### 📝 正在手動編譯訓練清單 (filelist.txt)...")
-                
                 gt_wavs_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "0_gt_wavs")
                 feature_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "3_feature768")
                 f0_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "2a_f0")
                 f0nsf_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "2b-f0nsf")
                 
-                if os.path.exists(gt_wavs_dir) and os.path.exists(feature_dir) and os.path.exists(f0_dir) and os.path.exists(f0nsf_dir):
-                    # 執行演算法交集比對，確保通過前兩步的所有切片都入列
-                    names = (
-                        set([name.split(".")[0] for name in os.listdir(gt_wavs_dir)])
-                        & set([name.split(".")[0] for name in os.listdir(feature_dir)])
-                        & set([name.split(".")[0] for name in os.listdir(f0_dir)])
-                        & set([name.split(".")[0] for name in os.listdir(f0nsf_dir)])
-                    )
-                    
-                    if not names:
-                        raise Exception("特徵提取未成功，生成的特徵交集為空！請檢查前兩步日誌。")
-                        
-                    opt_lines = []
-                    for name in sorted(list(names)):
-                        # 標準 RVC 訓練清單格式對齊
-                        line = f"logs/{new_model_name}/0_gt_wavs/{name}.wav|logs/{new_model_name}/3_feature768/{name}.npy|logs/{new_model_name}/2a_f0/{name}.wav.npy|logs/{new_model_name}/2b-f0nsf/{name}.wav.npy|0"
-                        opt_lines.append(line)
-                    
-                    target_filelist_txt = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "filelist.txt")
-                    with open(target_filelist_txt, "w", encoding="utf-8") as f:
-                        f.write("\n".join(opt_lines))
-                else:
-                    raise Exception("特徵提取目錄不完整，無法生成 filelist.txt！")
+                names = set(name.split(".")[0] for name in os.listdir(gt_wavs_dir)) & \
+                        set(name.split(".")[0] for name in os.listdir(feature_dir)) & \
+                        set(name.split(".")[0] for name in os.listdir(f0_dir)) & \
+                        set(name.split(".")[0] for name in os.listdir(f0nsf_dir))
                 
-                # --- 【自動動態生成 config.json】 ---
+                opt_lines = [f"logs/{new_model_name}/0_gt_wavs/{name}.wav|logs/{new_model_name}/3_feature768/{name}.npy|logs/{new_model_name}/2a_f0/{name}.wav.npy|logs/{new_model_name}/2b-f0nsf/{name}.wav.npy|0" for name in sorted(list(names))]
+                with open(os.path.join(RVC_FULL_DIR, rvc_logs_rel, "filelist.txt"), "w", encoding="utf-8") as f:
+                    f.write("\n".join(opt_lines))
+                
                 status_text.markdown("### ⚙️ 正在動態生成訓練設定檔 (config.json)...")
                 import json
-                
-                config_template_path = os.path.join(RVC_FULL_DIR, "configs", "v2", "40k.json")
-                if not os.path.exists(config_template_path):
-                    searched_templates = glob.glob(os.path.join(RVC_FULL_DIR, "configs", "**", "40k.json"), recursive=True)
-                    if searched_templates: config_template_path = searched_templates[0]
-                
-                if os.path.exists(config_template_path):
-                    with open(config_template_path, "r", encoding="utf-8") as f:
-                        config_data = json.load(f)
+                with open(config_template_path, "r", encoding="utf-8") as f: 
+                    config_data = json.load(f)
                     
-                    if "train" in config_data:
-                        config_data["train"]["batch_size"] = 8
-                        config_data["train"]["total_epoch"] = total_epochs
-                    if "data" in config_data:
-                        config_data["data"]["exp_dir"] = rvc_logs_rel
-                        config_data["data"]["training_files"] = f"./logs/{new_model_name}/filelist.txt"
-                    
-                    target_config_json = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "config.json")
-                    with open(target_config_json, "w", encoding="utf-8") as f:
-                        json.dump(config_data, f, indent=4, ensure_ascii=False)
-                else:
-                    raise Exception("核心組件缺失：在 configs 目錄下找不到 40k.json 配置範本！")
+                config_data["train"]["batch_size"] = 24
+                config_data["train"]["total_epoch"] = total_epochs
+                config_data["data"]["exp_dir"] = rvc_logs_rel
+                config_data["data"]["training_files"] = f"./logs/{new_model_name}/filelist.txt"
                 
-                # --- 步驟 C：正式訓練模型 ---
+                with open(os.path.join(RVC_FULL_DIR, rvc_logs_rel, "config.json"), "w", encoding="utf-8") as f:
+                    json.dump(config_data, f, indent=4, ensure_ascii=False)
+                
                 status_text.markdown(f"### 🔥 步驟 3/3：模型高強度訓練中 (目標 Epoch: {total_epochs})...")
                 cmd_train = [
-                    rvc_python, script_train,
+                    rvc_python, script_train, 
                     "-e", new_model_name, 
-                    "-sr", "40k", 
+                    "-sr", chosen_sample_rate,
                     "-f0", "1", 
                     "-bs", "8", 
                     "-g", "0", 
                     "-te", str(total_epochs), 
                     "-se", "50", 
                     "-v", "v2", 
-                    "-l", "0",  
-                    "-c", "1"   
+                    "-l", "0", 
+                    "-c", "1"
                 ]
-                if run_and_stream(cmd_train, RVC_FULL_DIR, log_box) != 0: raise Exception("模型訓練本體失敗")
-                
-                # --- 完成與部署 ---
-                status_text.markdown("### ✅ 訓練大功告成！正在自動掛載至翻唱工作站...")
+                if run_and_stream(cmd_train, RVC_FULL_DIR, log_box) != 0: 
+                    raise Exception("模型訓練本體失敗")
                 
                 trained_model_src = os.path.join(RVC_FULL_DIR, "assets", "weights", f"{new_model_name}.pth")
                 infer_model_dst = os.path.join(CURRENT_PROJECT_DIR, "rvc_engine", "assets", "weights", f"{new_model_name}.pth")
                 
                 st.session_state.is_training = False 
-                
                 if os.path.exists(trained_model_src):
+                    os.makedirs(os.path.dirname(infer_model_dst), exist_ok=True)
                     shutil.copy(trained_model_src, infer_model_dst)
-                    st.success(f"🎉 專屬模型 `{new_model_name}.pth` 已煉製完成並自動掛載！請前往「分頁 1」開始翻唱。")
+                    st.success(f"🎉 專屬模型 `{new_model_name}.pth` 已煉製完成！")
                     st.balloons()
-                else:
-                    st.warning("訓練已結束，但未在 assets/weights 偵測到生成的模型檔，請檢查底層日誌。")
-                    st.button("點擊刷新介面")
-                    
             except Exception as e:
                 st.session_state.is_training = False 
                 st.error(f"❌ 發生致命錯誤：{str(e)}")
                 st.button("確認並解除鎖定")
 
 # ==========================================
-# 分頁 3：訓練素材提取 (Data Preprocessing - 支援多檔案 + Zip 下載)
+# 分頁 3：訓練素材極限提取 (UVR5 + VAD)
 # ==========================================
 with tab3:
-    st.title("✂️ 訓練素材提取工具 (多檔案版)")
+    st.title("✂️ 訓練素材極限提取工具 (UVR5 + VAD 靜音提純)")
+    st.markdown("使用最強 BS-Roformer 與 DeReverb 模型，外加 VAD 靜音裁切引擎，為 RVC 打造完美的 0 雜訊高密度資料集。")
     
-    # 建立一個用來暫存處理結果的 State
     if 'processed_results' not in st.session_state:
         st.session_state.processed_results = []
     
     raw_files = st.file_uploader("上傳歌曲 (MP3/WAV/FLAC)", type=["mp3", "wav", "flac"], accept_multiple_files=True, key="toolkit_upload")
-    model_choice = st.selectbox(
-    "選擇分離模型", 
-    ["htdemucs", "mdx_extra_q"], 
-    help="若覺得人聲分離效果不自然，請切換至 mdx_extra_q。"
-)
     
-    if st.button("🚀 啟動 GPU 批次提取人聲", type="primary"):
-        st.session_state.processed_results = [] # 清空舊資料
-        with st.spinner("正在進行批次分離..."):
-            for uploaded_file in raw_files:
-                file_ext = os.path.splitext(uploaded_file.name)[1]
-                safe_name = f"proc_{int(time.time())}_{uploaded_file.name.replace(' ', '_')}"
-                tool_file_path = os.path.join(TOOL_DIR, safe_name)
-                
-                with open(tool_file_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                
-                try:
-                    run_demucs_safely(tool_file_path, TOOL_DIR, model=model_choice)
-                    vocals_path = os.path.join(TOOL_DIR, "htdemucs", os.path.splitext(safe_name)[0], "vocals.wav")
-                    if os.path.exists(vocals_path):
-                        st.session_state.processed_results.append({"name": uploaded_file.name, "path": vocals_path})
-                except Exception as e:
-                    st.error(f"檔案 {uploaded_file.name} 處理失敗")
-        st.rerun()
+    apply_bve = st.checkbox("啟用『和聲剝離 (BVE)』(分離主唱與和音，避免 RVC 抓錯雙音高產生機械音)", value=True)
+    apply_dereverb = st.checkbox("啟用『AI 極限乾聲提純』(自動調用 DeReverb 剝除空間音與殘響)", value=True)
+    apply_vad = st.checkbox("啟用『自動靜音裁切 (VAD)』(自動刪除無人聲的空白底噪，並插入安全斷點)", value=True)
+    
+    if st.button("🚀 啟動 GPU 批次極限提取", type="primary"):
+        # 1. 增加防呆：確認使用者有上傳檔案
+        if not raw_files:
+            st.warning("⚠️ 請先上傳至少一個音訊檔案！")
+        else:
+            st.session_state.processed_results = [] 
+            with st.spinner("正在喚醒 5070 Ti 進行深度特徵分離與時序提純..."):
+                for uploaded_file in raw_files:
+                    safe_name = f"proc_{int(time.time())}_{uploaded_file.name.replace(' ', '_')}"
+                    tool_file_path = os.path.join(TOOL_DIR, safe_name)
+                    
+                    with open(tool_file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    
+                    try:
+                        # 1. 頂級人聲分離 (Roformer)
+                        v_wet, _ = run_uvr5_safely(tool_file_path, TOOL_DIR, MODEL_ROFORMER, f"t3_{safe_name}")
+                        final_vocal_path = v_wet
 
-    # 顯示並提供下載
+                        # 2. 和音消除 (BVE)
+                        if apply_bve:
+                            v_lead_wet, _ = run_uvr5_safely(final_vocal_path, TOOL_DIR, MODEL_BVE, f"t3_bve_{safe_name}")
+                            final_vocal_path = v_lead_wet
+
+                        # 3. 頂級乾濕分離 (DeReverb)
+                        if apply_dereverb:
+                            # 💡 已經將 v_wet 修正為 final_vocal_path，接續上一步的純主唱！
+                            v_dry, _ = run_uvr5_safely(final_vocal_path, TOOL_DIR, MODEL_DEREVERB, f"t3_dr_{safe_name}")
+                            final_vocal_path = v_dry
+                            
+                        # 4. VAD 靜音裁切
+                        if apply_vad:
+                            v_vad_path = os.path.join(TOOL_DIR, f"vad_{safe_name}.wav")
+                            optimize_audio_for_rvc(final_vocal_path, v_vad_path)
+                            final_vocal_path = v_vad_path
+
+                        # 將最終結果重新命名
+                        output_final = os.path.join(TOOL_DIR, f"{os.path.splitext(uploaded_file.name)[0]}_AI_Dataset.wav")
+                        shutil.copy(final_vocal_path, output_final)
+                        
+                        st.session_state.processed_results.append({"name": uploaded_file.name, "path": output_final})
+                    except Exception as e:
+                        st.error(f"❌ 檔案 {uploaded_file.name} 處理失敗: {e}")
+            
+            # 💡 移除 st.rerun()！
+            # Streamlit 在這裡會自然往下接續執行，如果有成功的結果，就會直接顯示 ZIP 下載與音訊預覽畫面。
+
     if st.session_state.processed_results:
         st.success(f"✅ 已處理完成 {len(st.session_state.processed_results)} 個檔案")
         
-        # 1. 提供打包下載按鈕
-        zip_path = os.path.join(TOOL_DIR, "all_vocals.zip")
+        zip_path = os.path.join(TOOL_DIR, "all_dataset_vocals.zip")
         with zipfile.ZipFile(zip_path, 'w') as zipf:
             for item in st.session_state.processed_results:
                 orig_name_no_ext = os.path.splitext(item['name'])[0]
-                arc_name = f"{orig_name_no_ext}_vocals.wav"
+                arc_name = f"{orig_name_no_ext}_dataset.wav"
                 zipf.write(item['path'], arcname=arc_name)
 
         with open(zip_path, "rb") as f:
-            st.download_button("📦 下載所有人聲 (ZIP)", f, "All_Vocals.zip", "application/zip", type="primary")
+            st.download_button("📦 批次下載純淨訓練集 (ZIP)", f, "RVC_Dataset_Vocals.zip", "application/zip", type="primary")
 
-        # 2. 顯示個別下載與播放
         for item in st.session_state.processed_results:
             st.markdown("---")
             st.write(f"**{item['name']}**")
             st.audio(item['path'])
-            with open(item['path'], "rb") as f:
-                st.download_button(f"⬇️ 下載 {item['name']}", f, f"{item['name']}_vocal.wav", "audio/wav")
 
 # ==========================================
-# 分頁 4：音域分析可視化 (從 app2.py 完美移植)
+# 分頁 4：音域分析可視化
 # ==========================================
 with tab4:
-    # --- Streamlit 網頁介面設計 ---
     st.title("🎙️ 人聲音頻音域分析可視化工具 (高精確鋼琴版)")
-    st.markdown("上傳純人聲音頻檔案，系統將透過數據科學方法提取基頻，並於下方實體 88 鍵鋼琴矩陣上呈現精確音域密度分佈。")
+    st.markdown("上傳純人聲音頻，或上傳原曲並啟用快速分離，系統將繪製高精度的音高分佈鋼琴卷軸。")
     
-    # 增加獨立的 key 防止不同分頁 File Uploader 報錯衝突
-    uploaded_files_tab4 = st.file_uploader("請上傳純人聲音頻 (支援 wav, mp3, flac 等多個檔案)", type=['wav', 'mp3', 'flac', 'ogg'], accept_multiple_files=True, key="tab4_uploader")
+    uploaded_files_tab4 = st.file_uploader("請上傳音頻檔案 (WAV/MP3/FLAC)", type=['wav', 'mp3', 'flac', 'ogg'], accept_multiple_files=True, key="tab4_uploader")
     
-    # 初始化/維護智慧推薦的模型狀態，防止下載時因重新刷新而消失
-    if "recom_computed" not in st.session_state:
-        st.session_state.recom_computed = False
-    if "best_5_songs" not in st.session_state:
-        st.session_state.best_5_songs = []
-    if "best_5_counts" not in st.session_state:
-        st.session_state.best_5_counts = None
+    # 新增：Demucs 快速分離選項
+    use_demucs = st.checkbox("⚡ 上傳的檔案包含背景音樂，請先使用 Demucs 進行快速人聲提取 (大幅節省效能)", value=False)
     
-    # 當上傳新檔案清單改變時，自動重置智慧推薦狀態
+    if "recom_computed" not in st.session_state: st.session_state.recom_computed = False
+    if "best_5_songs" not in st.session_state: st.session_state.best_5_songs = []
+    if "best_5_counts" not in st.session_state: st.session_state.best_5_counts = None
+    
     current_files_hash = ",".join(sorted([f.name for f in uploaded_files_tab4])) if uploaded_files_tab4 else ""
     if "files_hash" not in st.session_state or st.session_state.files_hash != current_files_hash:
         st.session_state.files_hash = current_files_hash
@@ -773,159 +896,116 @@ with tab4:
         st.session_state.best_5_counts = None
     
     if uploaded_files_tab4:
-        total_counts = np.zeros(len(MIDI_KEYS))
-        images_dict = {}
-        song_data = [] # 用於存儲每首歌的名稱與頻次數據，供後續組合優化使用
-        
-        st.markdown("### 🎵 單曲音域分析")
-        progress_bar = st.progress(0)
-        
-        # --- 動態網格計算 ---
-        num_files = len(uploaded_files_tab4)
-        if num_files <= 6:
-            cols_per_row = 1
-        elif num_files <= 12:
-            cols_per_row = 2
-        elif num_files <= 18:
-            cols_per_row = 3
-        else:
-            cols_per_row = 4
-        
-        for i, file in enumerate(uploaded_files_tab4):
-            # 每當到達新的一行，就建立新的 columns 列
-            if i % cols_per_row == 0:
-                cols = st.columns(cols_per_row)
-                
-            # 將內容分配到對應的欄位中
-            with cols[i % cols_per_row]:
-                with st.spinner(f"正在分析音頻 ({i+1}/{num_files}): {file.name} ..."):
-                    file.seek(0)
-                    file_bytes = file.read() 
-                    
-                    single_counts = extract_pitch_distribution_fast(file_bytes, file.name)
-                    total_counts += single_counts
-                    song_data.append((file.name, single_counts))
-                    
-                    # 繪製單曲圖表
-                    fig = plot_piano_roll_distribution(single_counts, f"Vocal Range: {file.name}")
-                    st.pyplot(fig)
-                    
-                    img_buf = io.BytesIO()
-                    fig.savefig(img_buf, format='png', bbox_inches='tight', dpi=150)
-                    img_buf.seek(0)
-                    safe_name = file.name.rsplit('.', 1)[0]
-                    images_dict[f"Vocal_Range_{safe_name}.png"] = img_buf.getvalue()
-                    
-                    plt.close(fig) 
-                    
-            # 更新進度條
-            progress_bar.progress((i + 1) / num_files)
+        # 新增：觸發分析的按鈕，避免上傳後立刻卡住
+        if st.button("📊 開始繪製音域分析圖", type="primary"):
+            total_counts = np.zeros(len(MIDI_KEYS))
+            images_dict = {}
+            song_data = [] 
             
-        if len(uploaded_files_tab4) > 1:
-            st.markdown("---")
-            st.markdown("### 📈 所有歌曲累積音域分析 (Aggregated Range)")
-            with st.spinner("正在生成累積數據可視化..."):
-                # 這裡沒有放在 columns 裡，所以依然會佔據一個大格
-                fig_total = plot_piano_roll_distribution(total_counts, f"Cumulative Vocal Range ({len(uploaded_files_tab4)} Tracks)")
-                st.pyplot(fig_total)
+            st.markdown("### 🎵 單曲音域分析")
+            progress_bar = st.progress(0)
+            num_files = len(uploaded_files_tab4)
+            cols_per_row = 1 if num_files <= 6 else 2 if num_files <= 12 else 3 if num_files <= 18 else 4
+            
+            for i, file in enumerate(uploaded_files_tab4):
+                if i % cols_per_row == 0: cols = st.columns(cols_per_row)
+                with cols[i % cols_per_row]:
+                    # 狀態提示更新
+                    status_text = f"正在分析 ({i+1}/{num_files}): {file.name}"
+                    if use_demucs: status_text = f"正在分離並分析 ({i+1}/{num_files}): {file.name}"
+                    
+                    with st.spinner(status_text):
+                        # 處理檔案儲存與 Demucs 分離邏輯
+                        file.seek(0)
+                        
+                        if use_demucs:
+                            # 如果需要分離，先將檔案存入暫存區
+                            safe_name = f"t4_{int(time.time())}_{file.name.replace(' ', '_')}"
+                            temp_input_path = os.path.join(UPLOAD_DIR, safe_name)
+                            with open(temp_input_path, "wb") as f:
+                                f.write(file.read())
+                            
+                            try:
+                                # 調用輕量級 Demucs
+                                vocal_path = run_demucs_fast(temp_input_path, UPLOAD_DIR, safe_name)
+                                # 讀取分離後的乾聲給 librosa
+                                with open(vocal_path, "rb") as f:
+                                    file_bytes = f.read()
+                            except Exception as e:
+                                st.error(f"檔案 {file.name} 分離失敗: {e}")
+                                continue # 跳過此檔案，繼續下一個
+                        else:
+                            # 不需要分離，直接讀取
+                            file_bytes = file.read()
+                        
+                        # 核心音高分析 (不變)
+                        single_counts = extract_pitch_distribution_fast(file_bytes, file.name)
+                        total_counts += single_counts
+                        song_data.append((file.name, single_counts))
+                        
+                        fig = plot_piano_roll_distribution(single_counts, f"Vocal Range: {file.name}")
+                        st.pyplot(fig)
+                        
+                        img_buf = io.BytesIO()
+                        fig.savefig(img_buf, format='png', bbox_inches='tight', dpi=150)
+                        images_dict[f"Vocal_Range_{file.name.rsplit('.', 1)[0]}.png"] = img_buf.getvalue()
+                        plt.close(fig) 
+                progress_bar.progress((i + 1) / num_files)
                 
+            # --- 以下累積分析與推薦邏輯保持不變 ---
+            if len(song_data) > 1:
+                st.markdown("---")
+                st.markdown("### 📈 所有歌曲累積音域分析")
+                fig_total = plot_piano_roll_distribution(total_counts, f"Cumulative Vocal Range ({len(song_data)} Tracks)")
+                st.pyplot(fig_total)
                 img_buf = io.BytesIO()
                 fig_total.savefig(img_buf, format='png', bbox_inches='tight', dpi=150)
-                img_buf.seek(0)
                 images_dict["Cumulative_Vocal_Range.png"] = img_buf.getvalue()
-                
                 plt.close(fig_total)
-                
-        st.success("✅ 音頻分析與數據可視化完成！")
-        
-        # --- ✨ 新增功能：智能音域模型推薦分析 (當歌曲 >= 5 首時開放) ✨ ---
-        if len(uploaded_files_tab4) >= 5:
-            st.markdown("---")
-            st.markdown("### 🔮 智能模型數據優化")
-    
-            # 若尚未計算過，則顯示執行按鈕
-            if not st.session_state.recom_computed:
-                if st.button("🔮 執行智能音域模型推薦分析 (挑選最佳 5 首訓練集)", use_container_width=True, type="secondary"):
-                    with st.spinner("正在利用數據科學演算法遍歷最優組合，排除極端異常值..."):
-                        import scipy.sparse as sp
-                        
-                        # 1. 🛡️ 核心修復：對資料進行絕對排序，確保無論上傳順序如何，計算基準完全一致
-                        song_data_sorted = sorted(song_data, key=lambda x: x[0])
-                        names = [item[0] for item in song_data_sorted]
-                        counts_matrix = sp.csr_matrix([item[1] for item in song_data_sorted])
-                        
-                        best_density = -1
-                        best_total_frames = -1  # 用於平局時的第二決策指標
-                        best_indices = None
-                        best_counts = None      # 快取最優結果，避免迴圈外重複計算
-                        
-                        # 遍歷所有選 5 首的組合
-                        for idxs in itertools.combinations(range(len(song_data_sorted)), 5):
-                            # 透過 sparse matrix 疊加這 5 首的頻次
-                            comb_counts_sparse = counts_matrix[list(idxs)].sum(axis=0)
-                            # 轉回 1D NumPy array
-                            comb_counts = np.asarray(comb_counts_sparse).flatten()
-                            
-                            # 計算「音域密度」(Pitch Density)
-                            density_score = np.count_nonzero(comb_counts >= OUTLIER_THRESHOLD)
-                            
-                            # 計算該組合的總有效音訊幀數（作為第二指標）
-                            total_frames = comb_counts.sum()
-                            
-                            # 2. ⚖️ 雙重機制判定：
-                            # 條件 A: 發現了音域密度更高的組合
-                            # 條件 B: 密度平局，但該組合包含的總幀數（訊號量）更多，代表資料更紮實、更具代表性
-                            if (density_score > best_density) or (density_score == best_density and total_frames > best_total_frames):
-                                best_density = density_score
-                                best_total_frames = total_frames
-                                best_indices = idxs
-                                best_counts = comb_counts  # 直接接住數據
-                                    
-                        # 3. 💾 儲存最優結果至 Session State
-                        st.session_state.best_5_songs = [names[i] for i in best_indices]
-                        st.session_state.best_5_counts = best_counts  # 不再重複進行矩陣運算
-                        st.session_state.recom_computed = True
-                        st.rerun() # 強制刷新以渲染新生成的圖表
-                        
-            # 若已計算完成，直接渲染推薦結果與圖表
-            if st.session_state.recom_computed:
-                st.markdown("#### 🌟 最佳訓練集組合推薦結果")
-                st.info("💡 演算法已為你精選出以下 5 首歌曲。這個組合在**排除低於閾值的瞬間雜訊**後，擁有最密集的有效音域分佈（Pitch Density），最能代表該人聲的完整潛力，強烈建議作為 AI 語音訓練的核心 Dataset：")
-                
-                for idx, song_name in enumerate(st.session_state.best_5_songs, 1):
-                    st.markdown(f"**{idx}.** ` {song_name} `")
                     
-                # 生成並顯示這 5 首的累積圖
-                fig_recom = plot_piano_roll_distribution(st.session_state.best_5_counts, "Smart Recommended Dataset: Cumulative Vocal Range (Top 5)")
-                st.pyplot(fig_recom)
+            if len(song_data) >= 5:
+                st.markdown("---")
+                st.markdown("### 🔮 智能模型數據優化")
+                if not st.session_state.recom_computed:
+                    import scipy.sparse as sp
+                    song_data_sorted = sorted(song_data, key=lambda x: x[0])
+                    names = [item[0] for item in song_data_sorted]
+                    counts_matrix = sp.csr_matrix([item[1] for item in song_data_sorted])
+                    
+                    best_density, best_total_frames, best_indices, best_counts = -1, -1, None, None
+                    for idxs in itertools.combinations(range(len(song_data_sorted)), 5):
+                        comb_counts = np.asarray(counts_matrix[list(idxs)].sum(axis=0)).flatten()
+                        density_score = np.count_nonzero(comb_counts >= OUTLIER_THRESHOLD)
+                        total_frames = comb_counts.sum()
+                        if (density_score > best_density) or (density_score == best_density and total_frames > best_total_frames):
+                            best_density, best_total_frames, best_indices, best_counts = density_score, total_frames, idxs, comb_counts
+                                
+                    st.session_state.best_5_songs = [names[i] for i in best_indices]
+                    st.session_state.best_5_counts = best_counts  
+                    st.session_state.recom_computed = True
+                            
+                if st.session_state.recom_computed:
+                    st.info("💡 以下 5 首為最高效的訓練集組合：")
+                    for idx, song_name in enumerate(st.session_state.best_5_songs, 1):
+                        st.markdown(f"**{idx}.** ` {song_name} `")
+                    fig_recom = plot_piano_roll_distribution(st.session_state.best_5_counts, "Smart Recommended Dataset: Cumulative Vocal Range")
+                    st.pyplot(fig_recom)
+                    img_buf = io.BytesIO()
+                    fig_recom.savefig(img_buf, format='png', bbox_inches='tight', dpi=150)
+                    images_dict["Smart_Recommended_Top5.png"] = img_buf.getvalue()
+                    plt.close(fig_recom)
+                    
+            if images_dict:
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                    for img_name, img_bytes in images_dict.items(): zip_file.writestr(img_name, img_bytes)
                 
-                # 自動將這張精選圖轉成 bytes 塞進 images_dict 字典中
-                img_buf = io.BytesIO()
-                fig_recom.savefig(img_buf, format='png', bbox_inches='tight', dpi=150)
-                img_buf.seek(0)
-                images_dict["Smart_Recommended_Top5_Vocal_Range.png"] = img_buf.getvalue()
-                plt.close(fig_recom)
-                
-        # --- 💾 唯一的統一匯出按鈕（維持一鍵下載原則） ---
-        if images_dict:
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                for img_name, img_bytes in images_dict.items():
-                    zip_file.writestr(img_name, img_bytes)
-            
-            zip_buffer.seek(0)
-            
-            st.markdown("---")
-            st.markdown("### 💾 匯出所有分析圖表")
-            
-            # 根據是否執行了智能推薦，動態更改按鈕提示文字
-            btn_label = "📥 一鍵下載所有音域圖 (含智能推薦圖) (ZIP 檔)" if st.session_state.recom_computed else "📥 一鍵下載所有音域圖 (ZIP 檔)"
-            
-            st.download_button(
-                label=btn_label,
-                data=zip_buffer.getvalue(),
-                file_name="vocal_range_plots_package.zip",
-                mime="application/zip",
-                type="primary",
-                use_container_width=True
-            )
+                st.markdown("---")
+                st.download_button(
+                    label="📥 一鍵下載所有音域圖 (ZIP)",
+                    data=zip_buffer.getvalue(),
+                    file_name="vocal_range_plots.zip",
+                    mime="application/zip",
+                    type="primary",
+                    use_container_width=True
+                )

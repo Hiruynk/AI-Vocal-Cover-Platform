@@ -23,6 +23,18 @@ import torch
 import psutil   # 新增：用於偵測 RAM 記憶體
 import gc
 
+import soundfile as sf
+from audiosr import build_model, super_resolution
+
+# =========================================================
+# 【新增匯入：擴散模型與高階 DSP 混音】
+# =========================================================
+
+
+from pedalboard import Pedalboard, Compressor, HighpassFilter, Reverb, Chorus
+from pedalboard.io import AudioFile
+
+
 # =========================================================
 # 【系統層級設定與 FFmpeg Shared DLL 強行注入】
 # =========================================================
@@ -93,6 +105,115 @@ def check_and_warn_memory_usage():
 
 # 每次網頁刷新或按鈕觸發時，自動執行一次檢查
 check_and_warn_memory_usage()
+
+# =========================================================
+# 【修正：高階 AI 人聲後處理管線】
+# =========================================================
+def apply_pre_diffusion_denoise(input_path, output_path):
+    """在進入 AudioSR 前，先進行降噪與高頻截斷，防止電音偽影被擴散模型放大"""
+    from pedalboard import Pedalboard, HighpassFilter, LowpassFilter, NoiseGate
+    from pedalboard.io import AudioFile
+    
+    # 建立去電音與基礎降噪濾波鏈
+    board = Pedalboard([
+        # 1. 消除輕微底噪與 RVC 運算漏音
+        NoiseGate(threshold_db=-45, ratio=2.0, attack_ms=1.0, release_ms=100),
+        # 2. 砍除 80Hz 以下無用轟鳴，防止低頻干擾擴散模型
+        HighpassFilter(cutoff_frequency_hz=80),
+        # 3. 核心：RVC 金屬電音通常在 10kHz 以上，我們先強制削弱它，
+        # 後面讓 AudioSR 無中生有重新「畫出」真人的高頻泛音
+        LowpassFilter(cutoff_frequency_hz=10000)
+    ])
+    
+    with AudioFile(input_path) as f:
+        with AudioFile(output_path, 'w', f.samplerate, f.num_channels) as o:
+            while f.tell() < f.frames:
+                chunk = f.read(f.samplerate)
+                effected = board(chunk, f.samplerate, reset=False)
+                o.write(effected)
+
+def run_audiosr_restoration(input_path, output_path):
+    """調用 AudioSR 擴散模型消除 HiFi-GAN 金屬音與偽影 (修正長度偏移同步問題)"""
+    import soundfile as sf
+    import numpy as np
+    import torch
+    import gc
+    from audiosr import build_model, super_resolution
+    
+    data, sr = sf.read(input_path)
+    audiosr_model = build_model(model_name="basic", device="cuda:0")
+    
+    chunk_duration = 5  
+    chunk_samples = chunk_duration * sr
+    total_samples = len(data)
+    
+    import os
+    temp_chunk_in = input_path + "_tmp_chunk_in.wav"
+    restored_chunks = []
+    
+    for i in range(0, total_samples, chunk_samples):
+        chunk_data = data[i:i + chunk_samples]
+        sf.write(temp_chunk_in, chunk_data, sr)
+        
+        waveform = super_resolution(
+            audiosr_model, 
+            temp_chunk_in,
+            guidance_scale=3.5,  
+            ddim_steps=50
+        )
+        
+        wav = np.squeeze(waveform) 
+        if wav.ndim == 2 and wav.shape[0] < wav.shape[1]:
+            wav = wav.T 
+            
+        # 🚀 核心同步修正：強制將輸出的長度剪裁至與輸入完全一致！
+        expected_out_len = int(len(chunk_data) * 48000 / sr)
+        if len(wav) > expected_out_len:
+            # 切除 AudioSR 擅自加入的 Padding 延遲
+            wav = wav[:expected_out_len]
+        elif len(wav) < expected_out_len:
+            # 若有短缺則用靜音補齊，確保時序絕對鎖定
+            padding = np.zeros((expected_out_len - len(wav),) + wav.shape[1:]) if wav.ndim > 1 else np.zeros(expected_out_len - len(wav))
+            wav = np.concatenate([wav, padding])
+            
+        restored_chunks.append(wav)
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+    if restored_chunks[0].ndim == 2:
+        final_wav = np.vstack(restored_chunks)
+    else:
+        final_wav = np.concatenate(restored_chunks)
+        
+    sf.write(output_path, final_wav, 48000)
+    
+    if os.path.exists(temp_chunk_in):
+        try: os.remove(temp_chunk_in)
+        except Exception: pass
+            
+    del audiosr_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def apply_studio_dsp(input_path, output_path):
+    """調用 Pedalboard 進行廣播級動態塑形與自動混響"""
+    board = Pedalboard([
+        HighpassFilter(cutoff_frequency_hz=80),
+        Compressor(threshold_db=-15, ratio=4.0, attack_ms=2.0, release_ms=50),
+        Compressor(threshold_db=-20, ratio=2.0, attack_ms=15.0, release_ms=250),
+        Chorus(rate_hz=1.0, depth=0.1, centre_delay_ms=2.0, mix=0.15),
+        Reverb(room_size=0.5, damping=0.5, wet_level=0.25, dry_level=0.85)
+    ])
+    
+    with AudioFile(input_path) as f:
+        with AudioFile(output_path, 'w', f.samplerate, f.num_channels) as o:
+            while f.tell() < f.frames:
+                chunk = f.read(f.samplerate)
+                effected = board(chunk, f.samplerate, reset=False)
+                o.write(effected)
+
 # =========================================================
 # 【AI 模型常數設定】
 # =========================================================
@@ -356,15 +477,26 @@ if 'init_cleanup' not in st.session_state:
     
     # 清理 Page 1 & Page 4 的暫存音訊 (不包含 RVC 訓練資料)
     for f in glob.glob(os.path.join(UPLOAD_DIR, "*")):
-        try: os.remove(f) if os.path.isfile(f) else shutil.rmtree(f)
-        except Exception: pass
+        try:
+            if os.path.isfile(f):
+                os.remove(f)
+            else:
+                shutil.rmtree(f)
+        except Exception:
+            pass
         
     # 清理 Page 3 的分離暫存與 ZIP 包
     for f in glob.glob(os.path.join(TOOL_DIR, "*")):
-        try: os.remove(f) if os.path.isfile(f) else shutil.rmtree(f)
-        except Exception: pass
+        try:
+            if os.path.isfile(f):
+                os.remove(f)
+            else:
+                shutil.rmtree(f)
+        except Exception:
+            pass
         
-    sys.stderr.write("\n\033[93m[🔄 系統] 網頁已刷新，已自動清空 temp_audio 與 temp_toolkit 暫存資料夾以釋放空間。\033[0m\n")
+    # 加入 _ = 防止 sys.stderr.write 的回傳值(字節數)被印在網頁上
+    _ = sys.stderr.write("\n\033[93m[🔄 系統] 網頁已刷新，已自動清空 temp_audio 與 temp_toolkit 暫存資料夾以釋放空間。\033[0m\n")
 
 if 'step1' not in st.session_state: st.session_state.step1 = False
 if 'step2' not in st.session_state: st.session_state.step2 = False
@@ -390,10 +522,10 @@ with st.sidebar:
 tab1, tab2, tab3, tab4 = st.tabs(["🎙️ 日常翻唱工作站", "⚙️ 建立新音色", "✂️ 訓練素材提取", "📊 音域分析可視化"])
 
 # ==========================================
-# 分頁 1：日常翻唱工作站
+# 分頁 1：日常翻唱工作站 (升級擴散修復與 DSP 版)
 # ==========================================
 with tab1:
-    st.title("🎙️ AI 歌聲轉換管線 (UVR5 極致版)")
+    st.title("🎙️ AI 歌聲轉換管線 (極致 DSP 版)")
     uploaded_file = st.file_uploader("1. 上傳目標歌曲 (MP3/WAV/FLAC)", type=["mp3", "wav", "flac"])
     
     if uploaded_file is not None:
@@ -419,9 +551,8 @@ with tab1:
         st.markdown("---")
         st.subheader(f"2. 極限人聲分離與 AI 去混響 (UVR5) - 當前處理: `{original_name}`")
         
-        # 定義多出來的和音路徑
         inst_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Instrumental.wav")
-        vocals_backing_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Vocals_Backing.wav") # 新增和音軌
+        vocals_backing_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Vocals_Backing.wav")
         vocals_wet_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Vocals_Wet.wav")
         vocals_dry_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Vocals_Dry.wav")
         vocals_effects_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_Vocals_Reverb.wav")
@@ -450,20 +581,15 @@ with tab1:
 
         if st.session_state.step2 and os.path.exists(vocals_dry_path):
             st.success("✅ UVR5 極限分離與環境特徵提取完成！")
-            col_1, col_2, col_3 = st.columns(3)
-            with col_1:
-                st.caption("🎙️ 極限乾聲 (餵給 AI 推理)")
-                st.audio(vocals_dry_path)
-            with col_2:
-                st.caption("🌌 原曲環境特徵 (純混響與和聲)")
-                st.audio(vocals_effects_path)
-            with col_3:
-                st.caption("🎸 純伴奏")
-                st.audio(inst_path)
             
             st.markdown("---")
-            st.subheader("3. 音色轉換 (RVC Inference)")
-            output_vocal_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_ai_vocals.wav")
+            st.subheader("3. 智慧音色轉換與後期修復")
+            
+            # 定義所有可能的輸出路徑
+            out_vocal_raw = os.path.join(UPLOAD_DIR, f"{safe_basename}_ai_lead_raw.wav")
+            out_backing_raw = os.path.join(UPLOAD_DIR, f"{safe_basename}_ai_backing_raw.wav")
+            out_vocal_final = os.path.join(UPLOAD_DIR, f"{safe_basename}_ai_lead_final.wav")
+            out_backing_final = os.path.join(UPLOAD_DIR, f"{safe_basename}_ai_backing_final.wav")
             
             rvc_weights_dir = os.path.join(RVC_FULL_DIR, "assets", "weights")
             available_models = [f for f in os.listdir(rvc_weights_dir) if f.endswith(".pth")]
@@ -471,100 +597,136 @@ with tab1:
             if not available_models:
                 st.warning(f"⚠️ 尚未偵測到模型！請確認檔案已放入: {rvc_weights_dir}")
             else:
-                selected_model = st.selectbox("選擇你的音色模型", available_models)
-                pitch_shift = st.slider("人聲升降調 (Pitch Shift)", -12, 12, 0, 1)
-                
-                if not st.session_state.step3:
-                    if st.button("🚀 開始執行轉換"):
-                        st.info(f"正在載入模型：{selected_model} ...")
-                        log_box = st.empty() 
-                        
-                        abs_vocals_dry = os.path.abspath(vocals_dry_path)
-                        abs_output = os.path.abspath(output_vocal_path)
-                        
-                        rvc_python = os.path.join(RVC_FULL_DIR, "runtime", "python.exe")
-                        rvc_script = os.path.join(RVC_FULL_DIR, "tools", "infer_cli.py")
-                        
-                        model_basename = os.path.splitext(selected_model)[0]
-                        found_indexes = glob.glob(os.path.join(RVC_FULL_DIR, "logs", model_basename, "added_*.index"))
-                        index_path = found_indexes[0] if found_indexes else ""
+                col_m1, col_m2 = st.columns(2)
+                with col_m1:
+                    selected_model = st.selectbox("選擇主唱音色模型", available_models)
+                with col_m2:
+                    pitch_shift = st.slider("整體人聲升降調 (Pitch Shift)", -12, 12, 0, 1)
 
+                st.markdown("**進階處理選項：**")
+                do_backing = st.checkbox("🎤 開啟『和音同步推理』 (將原曲和聲一併轉換為你的 AI 音色)", value=True)
+                do_audiosr = st.checkbox("✨ 開啟『AudioSR 擴散修復』 (消除 HiFi-GAN 機械音與高頻偽影，極致擬真)", value=True)
+                do_dsp = st.checkbox("🎛️ 開啟『Pedalboard 自動混音』 (加入錄音室級動態壓縮與自然空間混響)", value=True)
+                
+                # 🚀 【修改點 1】：解除 if not st.session_state.step3 的包裹限制，按鈕改為動態文字
+                # 這樣參數配置區永遠不會消失，用戶換了模型或變調後，隨時可以再次點擊按鈕重新推理
+                btn_text = "🚀 啟動完整轉換與修復管線" if not st.session_state.step3 else "🔄 更換音色或參數並重新推理"
+                if st.button(btn_text, type="primary" if not st.session_state.step3 else "secondary"):
+                    log_box = st.empty() 
+                    rvc_python = os.path.join(RVC_FULL_DIR, "runtime", "python.exe")
+                    rvc_script = os.path.join(RVC_FULL_DIR, "tools", "infer_cli.py")
+                    
+                    model_basename = os.path.splitext(selected_model)[0]
+                    found_indexes = glob.glob(os.path.join(RVC_FULL_DIR, "logs", model_basename, "added_*.index"))
+                    index_path = found_indexes[0] if found_indexes else ""
+
+                    # 內部 RVC 執行閉包
+                    def run_rvc(in_path, out_path, role_name):
+                        st.info(f"正在執行 RVC 深度推理 ({role_name})...")
                         cmd = [
                             rvc_python, rvc_script,
                             "--f0up_key", str(pitch_shift),
-                            "--input_path", abs_vocals_dry,
-                            "--opt_path", abs_output,
+                            "--input_path", os.path.abspath(in_path),
+                            "--opt_path", os.path.abspath(out_path),
                             "--model_name", selected_model,
                             "--f0method", "rmvpe",
                             "--index_path", index_path,
-                            "--device", "cuda:0"
+                            "--device", "cuda:0",
+                            "--index_rate", "0.75",       
+                            "--protect", "0.45",          
+                            "--resample_sr", "48000",     
+                            "--filter_radius", "5"        
                         ]
+                        if run_and_stream(cmd, RVC_FULL_DIR, log_box) != 0:
+                            raise Exception(f"{role_name} 推理失敗")
+
+                    try:
+                        # 1. RVC 主唱推理
+                        run_rvc(vocals_dry_path, out_vocal_raw, "主唱")
+                        current_lead = out_vocal_raw
+                        current_backing = vocals_backing_path 
+
+                        # 2. RVC 和音推理
+                        if do_backing and os.path.exists(vocals_backing_path):
+                            run_rvc(vocals_backing_path, out_backing_raw, "和音")
+                            current_backing = out_backing_raw
+
+                        # 3. AudioSR 擴散修復
+                        if do_audiosr:
+                            st.info("正在執行 Pre-Diffusion 降噪與濾波 (抑制電音與底噪)...")
+                            denoised_lead_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_denoised_lead.wav")
+                            apply_pre_diffusion_denoise(current_lead, denoised_lead_path)
+                            current_lead = denoised_lead_path
+                            
+                            if do_backing and os.path.exists(current_backing):
+                                denoised_backing_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_denoised_backing.wav")
+                                apply_pre_diffusion_denoise(current_backing, denoised_backing_path)
+                                current_backing = denoised_backing_path
+
+                            st.info("正在執行 AudioSR 擴散模型修復 (重建高保真細節)...")
+                            sr_lead_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_sr_lead.wav")
+                            run_audiosr_restoration(current_lead, sr_lead_path)
+                            current_lead = sr_lead_path
+                            
+                            if do_backing and os.path.exists(current_backing):
+                                sr_backing_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_sr_backing.wav")
+                                run_audiosr_restoration(current_backing, sr_backing_path)
+                                current_backing = sr_backing_path
+
+                        # 4. Pedalboard 高階 DSP
+                        if do_dsp:
+                            st.info("正在應用 Pedalboard 錄音室級動態與混響處理...")
+                            dsp_lead_path = out_vocal_final
+                            apply_studio_dsp(current_lead, dsp_lead_path)
+                            current_lead = dsp_lead_path
+                            
+                            if do_backing and os.path.exists(current_backing):
+                                dsp_backing_path = out_backing_final
+                                apply_studio_dsp(current_backing, dsp_backing_path)
+                                current_backing = dsp_backing_path
+                        else:
+                            shutil.copy(current_lead, out_vocal_final)
+                            if os.path.exists(current_backing):
+                                shutil.copy(current_backing, out_backing_final)
+
+                        # 記錄狀態
+                        st.session_state.final_lead_path = out_vocal_final
+                        st.session_state.final_backing_path = out_backing_final if do_backing else vocals_backing_path
+                        st.session_state.used_dsp = do_dsp
+                        st.session_state.step3 = True
                         
-                        try:
-                            if run_and_stream(cmd, RVC_FULL_DIR, log_box) != 0:
-                                st.error("❌ RVC 推理失敗！")
-                            else:
-                                st.session_state.step3 = True
-                                st.rerun()
-                        except Exception as e:
-                            st.error(f"系統執行失敗: {e}")
+                        # 🚀 【修改點 2】：重新推理時，強制將第四步的「最終混音預覽」重置，防止舊的混音成果與新音色發生衝突
+                        st.session_state.step4_preview = False
+                        st.session_state.preview_path = ""
+                        st.rerun()
 
-            if st.session_state.step3 and os.path.exists(output_vocal_path):
-                st.markdown("---")
-                st.subheader("📊 AI 咬字與音高對齊精準度分析")
-                with st.spinner("正在繪製聲學特徵曲線對比圖..."):
-                    snd_orig = parselmouth.Sound(vocals_dry_path)
-                    snd_ai = parselmouth.Sound(output_vocal_path)
-                    
-                    pitch_orig = snd_orig.to_pitch(time_step=0.01)
-                    pitch_ai = snd_ai.to_pitch(time_step=0.01)
-                    
-                    f0_orig = pitch_orig.selected_array['frequency']
-                    f0_ai = pitch_ai.selected_array['frequency']
-                    
-                    f0_orig[f0_orig == 0] = np.nan
-                    f0_ai[f0_ai == 0] = np.nan
-                    
-                    fig_pitch, ax_pitch = plt.subplots(figsize=(14, 4))
-                    ax_pitch.plot(pitch_orig.xs(), f0_orig, label="原曲極限乾聲 (Target)", color='gray', alpha=0.5, linewidth=3)
-                    
-                    shift_hz_ratio = 2 ** (pitch_shift / 12)
-                    adjusted_f0_ai = f0_ai / shift_hz_ratio
-                    
-                    ax_pitch.plot(pitch_ai.xs(), adjusted_f0_ai, label="AI 推理人聲 (Inferred)", color='darkorange', alpha=0.9, linewidth=1.5)
-                    
-                    ax_pitch.set_title("Vocal Pitch Tracking: Original vs AI Inferred", fontsize=12)
-                    ax_pitch.set_xlabel("Time (Seconds)", fontsize=10)
-                    ax_pitch.set_ylabel("Frequency (Hz)", fontsize=10)
-                    ax_pitch.legend(loc="upper right")
-                    ax_pitch.grid(True, linestyle='--', alpha=0.3)
-                    
-                    st.pyplot(fig_pitch)
-                    plt.close(fig_pitch)
+                    except Exception as e:
+                        st.error(f"系統執行失敗: {e}")
 
+            # 🚀 【修改點 3】：將第四步的多軌混音控制台移出 else 區塊。
+            # 當 step3 為 True 且輸出檔案存在時，混音面板會直接在下方展開，而不會擋住上方的模型切換區。
+            if st.session_state.step3 and os.path.exists(st.session_state.get('final_lead_path', '')):
                 st.markdown("---")
-                st.subheader("4. 多軌特徵混音微調 (專業四軌預覽)")
+                st.subheader("4. 多軌特徵混音微調 (最終輸出)")
                 
-                # 擴展為 5 個控制項
                 col_v_vol, col_i_vol, col_b_vol, col_e_vol, col_i_pitch = st.columns(5)
-                with col_v_vol: vocal_volume = st.slider("AI 乾聲音量 (dB)", -15.0, 15.0, 0.0, 1.0, key=f"v_vol_{uid}")
-                with col_i_vol: inst_volume = st.slider("伴奏音量 (dB)", -15.0, 15.0, 0.0, 1.0, key=f"i_vol_{uid}")
-                with col_b_vol: backing_volume = st.slider("和聲音量 (dB)", -15.0, 15.0, -1.0, 1.0, key=f"b_vol_{uid}")
-                with col_e_vol: effects_volume = st.slider("殘響特徵音量 (dB)", -20.0, 10.0, -2.0, 1.0, key=f"e_vol_{uid}")
-                with col_i_pitch: inst_pitch = st.slider("伴奏/和音升降調", -12, 12, value=pitch_shift, step=1, key=f"i_pitch_{uid}")
+                with col_v_vol: vocal_volume = st.slider("AI 主聲音量 (dB)", -15.0, 15.0, 2.0, 1.0, key=f"v_vol_{uid}")
+                with col_i_vol: inst_volume = st.slider("純伴奏音量 (dB)", -15.0, 15.0, 0.0, 1.0, key=f"i_vol_{uid}")
+                with col_b_vol: backing_volume = st.slider("和聲音量 (dB)", -15.0, 15.0, -2.0, 1.0, key=f"b_vol_{uid}")
+                
+                default_eff_vol = -20.0 if st.session_state.get('used_dsp', False) else -2.0
+                with col_e_vol: effects_volume = st.slider("原曲殘響音量 (dB)", -30.0, 10.0, default_eff_vol, 1.0, key=f"e_vol_{uid}")
+                with col_i_pitch: inst_pitch = st.slider("伴奏升降調", -12, 12, value=pitch_shift, step=1, key=f"i_pitch_{uid}")
                 
                 temp_preview_path = os.path.join(UPLOAD_DIR, f"{safe_basename}_preview.wav")
                 
-                if st.button("🎧 產生多軌特徵混音預覽", type="secondary"):
+                if st.button("🎧 產生最終混音預覽", type="secondary"):
                     with st.spinner("正在處理音軌立體聲重構與多層特徵疊加..."):
                         current_inst_path = inst_path
-                        current_backing_path = vocals_backing_path
+                        current_backing_path = st.session_state.final_backing_path
                         
-                        # 伴奏與和音必須同時升降調，否則和弦會打架
                         if inst_pitch != 0:
                             shifted_inst_path = os.path.join(UPLOAD_DIR, f"shifted_inst_{uid}.wav")
-                            shifted_backing_path = os.path.join(UPLOAD_DIR, f"shifted_backing_{uid}.wav")
-                            
                             shift_script = os.path.join(TOOL_DIR, "shift_pitch.py")
                             if not os.path.exists(shift_script):
                                 with open(shift_script, "w", encoding="utf-8") as f:
@@ -572,23 +734,21 @@ with tab1:
                             
                             rvc_python = os.path.join(RVC_FULL_DIR, "runtime", "python.exe")
                             
-                            # 變調伴奏
                             if not os.path.exists(shifted_inst_path):
                                 subprocess.run([rvc_python, shift_script, inst_path, shifted_inst_path, str(inst_pitch)], check=True)
                             current_inst_path = shifted_inst_path
                             
-                            # 變調和音
-                            if not os.path.exists(shifted_backing_path):
-                                subprocess.run([rvc_python, shift_script, vocals_backing_path, shifted_backing_path, str(inst_pitch)], check=True)
-                            current_backing_path = shifted_backing_path
+                            if current_backing_path == vocals_backing_path:
+                                shifted_backing_path = os.path.join(UPLOAD_DIR, f"shifted_backing_{uid}.wav")
+                                if not os.path.exists(shifted_backing_path):
+                                    subprocess.run([rvc_python, shift_script, vocals_backing_path, shifted_backing_path, str(inst_pitch)], check=True)
+                                current_backing_path = shifted_backing_path
                         
-                        # 組合四軌音訊
                         inst_audio = AudioSegment.from_file(current_inst_path) + inst_volume
                         backing_audio = AudioSegment.from_file(current_backing_path) + backing_volume
-                        vocal_audio = AudioSegment.from_file(output_vocal_path) + vocal_volume
+                        vocal_audio = AudioSegment.from_file(st.session_state.final_lead_path) + vocal_volume
                         effects_audio = AudioSegment.from_file(vocals_effects_path) + effects_volume
                         
-                        # 疊加輸出 (乾聲 + 殘響 + 和聲 + 伴奏)
                         final_vocal = vocal_audio.overlay(effects_audio)
                         final_inst = inst_audio.overlay(backing_audio)
                         final_audio = final_inst.overlay(final_vocal)
@@ -604,13 +764,20 @@ with tab1:
                     st.audio(st.session_state.preview_path)
                     
                     if st.button("💾 合併並存入歷史紀錄", type="primary"):
-                        final_mix_path = os.path.join(UPLOAD_DIR, f"{original_name}_AI_{uid}.wav")
+                        import uuid
+                        # 💡 每次儲存都產生一個獨立的「混音專屬 ID」，避免檔案與按鍵衝突
+                        mix_id = uuid.uuid4().hex[:6]
+                        final_mix_path = os.path.join(UPLOAD_DIR, f"{original_name}_AI_{uid}_{mix_id}.wav")
                         shutil.copy(st.session_state.preview_path, final_mix_path)
                         
-                        history_item = {"title": f"{original_name} (Vol: V{vocal_volume}/I{inst_volume})", "path": final_mix_path, "id": uid}
-                        if not any(item['id'] == uid for item in st.session_state.history):
-                            st.session_state.history.append(history_item)
-                        st.success("🎉 已儲存！")
+                        history_item = {
+                            "title": f"{original_name} (Vol: V{vocal_volume}/I{inst_volume})", 
+                            "path": final_mix_path, 
+                            "id": f"{uid}_{mix_id}" # 確保 ID 絕對唯一
+                        }
+                        st.session_state.history.append(history_item)
+                        
+                        st.success("🎉 已儲存新混音版本！")
                         st.balloons()
 
     if st.session_state.history:
@@ -633,30 +800,55 @@ with tab1:
 # ==========================================
 with tab2:
     st.title("⚙️ 本機 AI 聲音模型訓練")
+    st.markdown("💡 **進階提示：** 若要**斷點續訓**，請輸入已存在的模型名稱，並「留空」音檔上傳區，系統將自動從上次進度繼續訓練。")
+    
     if "is_training" not in st.session_state:
         st.session_state.is_training = False
         
     CURRENT_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
     
-    new_model_name = st.text_input("1. 為新模型命名 (英文/數字)", disabled=st.session_state.is_training)
-    dataset_files = st.file_uploader("2. 上傳乾淨人聲 (WAV)", accept_multiple_files=True, type=['wav'], disabled=st.session_state.is_training)
-    total_epochs = st.slider("3. 訓練輪數 (Total Epochs)", 10, 300, 100, 10, disabled=st.session_state.is_training)
+    # --- UI 參數設定區 ---
+    new_model_name = st.text_input("1. 為新模型命名 (英文/數字) - 相同名稱將觸發續訓", disabled=st.session_state.is_training)
+    dataset_files = st.file_uploader("2. 上傳乾淨人聲 (WAV) - 續訓可略過", accept_multiple_files=True, type=['wav'], disabled=st.session_state.is_training)
+    
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        total_epochs = st.slider("3. 訓練總輪數 (Total Epochs)", 10, 500, 100, 10, disabled=st.session_state.is_training)
+    with col_t2:
+        # 新增：定期存檔頻率滑桿
+        save_freq = st.slider("4. 定期存檔頻率 (每 N 輪存檔一次)", 5, 100, 20, 5, disabled=st.session_state.is_training)
+        st.caption("💡 存檔將保留為 `模型名_e輪數_s步數.pth`，可於 Tab 1 隨時載入試聽。")
     
     if st.session_state.is_training:
         st.button("🔥 正在全速深層學習中，請勿重新整理網頁...", type="secondary", disabled=True)
     else:
-        start_train_btn = st.button("🚀 啟動全自動訓練", type="primary")
+        start_train_btn = st.button("🚀 啟動全自動訓練 (或續訓)", type="primary")
         
+    # --- 訓練邏輯驗證 ---
     if not st.session_state.is_training and start_train_btn:
-        if not new_model_name or not dataset_files: 
-            st.error("請填寫模型名稱並上傳音檔！")
+        if not new_model_name:
+            st.error("請填寫模型名稱！")
         else:
+            # 判斷是「全新訓練」還是「斷點續訓」
+            is_resuming = False
+            rvc_logs_rel = f"logs/{new_model_name}"
+            log_dir_path = os.path.join(RVC_FULL_DIR, rvc_logs_rel)
+            
+            if os.path.exists(log_dir_path) and not dataset_files:
+                st.info(f"偵測到現有模型目錄且未上傳新資料，將啟動【斷點續訓】模式！")
+                is_resuming = True
+            elif not dataset_files:
+                st.error("全新模型必須上傳訓練音檔！")
+                st.stop()
+                
             st.session_state.is_training = True
+            st.session_state.is_resuming = is_resuming
             st.rerun()
 
     if st.session_state.is_training:
         status_text = st.empty()
         log_box = st.empty() 
+        is_resuming = st.session_state.get("is_resuming", False)
         
         def find_rvc_script(target_names):
             for name in target_names:
@@ -669,126 +861,160 @@ with tab2:
         script_extract_feat = find_rvc_script(["extract_feature_print.py", "extract_feature.py"])
         script_train = find_rvc_script(["train.py", "train_v2.py"])
 
+        # 🚀 移除對 train_index.py 的依賴，只檢查這四個核心檔案
         if not all([script_preprocess, script_extract_f0, script_extract_feat, script_train]):
             st.session_state.is_training = False
-            st.error("❌ 核心腳本定位失敗！")
+            st.error("❌ RVC 核心腳本定位失敗！請檢查 RVC 資料夾是否完整。")
             st.button("重試並解除鎖定")
         else:
             rvc_dataset_rel = f"dataset/{new_model_name}"
             rvc_logs_rel = f"logs/{new_model_name}"
-            os.makedirs(os.path.join(RVC_FULL_DIR, rvc_dataset_rel), exist_ok=True)
-            os.makedirs(os.path.join(RVC_FULL_DIR, rvc_logs_rel), exist_ok=True)
-            
-            for f in dataset_files:
-                with open(os.path.join(RVC_FULL_DIR, rvc_dataset_rel, f.name), "wb") as out_f:
-                    out_f.write(f.getbuffer())
-            
             rvc_python = os.path.join(RVC_FULL_DIR, "runtime", "python.exe")
-                    
+            
             try:
-                # ==========================================
-                # 💡 全局採樣率 (Sample Rate) 統一偵測區塊
-                # ==========================================
+                chosen_sample_rate = "40k" # 預設值
                 possible_paths = [
                     os.path.join(RVC_FULL_DIR, "configs", "48k.json"),
                     os.path.join(RVC_FULL_DIR, "configs", "v2", "48k.json"),
                     os.path.join(RVC_FULL_DIR, "configs", "40k.json"),
-                    os.path.join(RVC_FULL_DIR, "configs", "v2", "40k.json"),
-                    os.path.join(RVC_FULL_DIR, "configs", "32k.json"),
-                    os.path.join(RVC_FULL_DIR, "configs", "v2", "32k.json")
+                    os.path.join(RVC_FULL_DIR, "configs", "32k.json")
                 ]
-                
-                config_template_path = None
-                chosen_sample_rate = "40k" # 預設值
-                
-                for path in possible_paths:
-                    if os.path.exists(path):
-                        config_template_path = path
-                        if "48k" in path: chosen_sample_rate = "48k"
-                        elif "32k" in path: chosen_sample_rate = "32k"
-                        elif "40k" in path: chosen_sample_rate = "40k"
-                        break
-                        
-                if not config_template_path:
-                    available_configs = os.listdir(os.path.join(RVC_FULL_DIR, "configs")) if os.path.exists(os.path.join(RVC_FULL_DIR, "configs")) else []
-                    raise FileNotFoundError(f"❌ 找不到 RVC 訓練設定範本！當前 configs 資料夾內包含: {available_configs}")
-
-                # 對應數字採樣率給 preprocess 使用
+                config_template_path = next((p for p in possible_paths if os.path.exists(p)), None)
+                if config_template_path:
+                    if "48k" in config_template_path: chosen_sample_rate = "48k"
+                    elif "32k" in config_template_path: chosen_sample_rate = "32k"
                 sr_numeric_map = {"48k": "48000", "40k": "40000", "32k": "32000"}
                 preprocess_sr = sr_numeric_map[chosen_sample_rate]
-                
-                st.info(f"ℹ️ 已自動匹配本機 RVC 設定檔範本: {os.path.basename(config_template_path)} (採用全局 {chosen_sample_rate} 規格)")
 
                 # ==========================================
-                # 開始執行三步驟管線
+                # 前置處理 (全新訓練時才執行)
                 # ==========================================
-                status_text.markdown(f"### ⏳ 步驟 1/3：處理音頻切片 (目標採樣率: {preprocess_sr} Hz)...")
-                if run_and_stream([rvc_python, script_preprocess, rvc_dataset_rel, preprocess_sr, "8", rvc_logs_rel, "False", "3.0"], RVC_FULL_DIR, log_box) != 0: 
-                    raise Exception("音頻切片失敗")
-                
-                status_text.markdown("### ⏳ 步驟 2/3：提取神經網路特徵 (Hubert & RMVPE)...")
-                if run_and_stream([rvc_python, script_extract_f0, rvc_logs_rel, "8", "rmvpe"], RVC_FULL_DIR, log_box) != 0: 
-                    raise Exception("F0提取失敗")
-                if run_and_stream([rvc_python, script_extract_feat, "cuda:0", "1", "0", "0", rvc_logs_rel, "v2", "True"], RVC_FULL_DIR, log_box) != 0: 
-                    raise Exception("特徵提取失敗")
-                
-                status_text.markdown("### 📝 正在手動編譯訓練清單 (filelist.txt)...")
-                gt_wavs_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "0_gt_wavs")
-                feature_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "3_feature768")
-                f0_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "2a_f0")
-                f0nsf_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "2b-f0nsf")
-                
-                names = set(name.split(".")[0] for name in os.listdir(gt_wavs_dir)) & \
-                        set(name.split(".")[0] for name in os.listdir(feature_dir)) & \
-                        set(name.split(".")[0] for name in os.listdir(f0_dir)) & \
-                        set(name.split(".")[0] for name in os.listdir(f0nsf_dir))
-                
-                opt_lines = [f"logs/{new_model_name}/0_gt_wavs/{name}.wav|logs/{new_model_name}/3_feature768/{name}.npy|logs/{new_model_name}/2a_f0/{name}.wav.npy|logs/{new_model_name}/2b-f0nsf/{name}.wav.npy|0" for name in sorted(list(names))]
-                with open(os.path.join(RVC_FULL_DIR, rvc_logs_rel, "filelist.txt"), "w", encoding="utf-8") as f:
-                    f.write("\n".join(opt_lines))
-                
-                status_text.markdown("### ⚙️ 正在動態生成訓練設定檔 (config.json)...")
-                import json
-                with open(config_template_path, "r", encoding="utf-8") as f: 
-                    config_data = json.load(f)
+                if not is_resuming:
+                    os.makedirs(os.path.join(RVC_FULL_DIR, rvc_dataset_rel), exist_ok=True)
+                    os.makedirs(os.path.join(RVC_FULL_DIR, rvc_logs_rel), exist_ok=True)
                     
-                config_data["train"]["batch_size"] = 24
-                config_data["train"]["total_epoch"] = total_epochs
-                config_data["data"]["exp_dir"] = rvc_logs_rel
-                config_data["data"]["training_files"] = f"./logs/{new_model_name}/filelist.txt"
-                
-                with open(os.path.join(RVC_FULL_DIR, rvc_logs_rel, "config.json"), "w", encoding="utf-8") as f:
-                    json.dump(config_data, f, indent=4, ensure_ascii=False)
-                
-                status_text.markdown(f"### 🔥 步驟 3/3：模型高強度訓練中 (目標 Epoch: {total_epochs})...")
+                    for f in dataset_files:
+                        with open(os.path.join(RVC_FULL_DIR, rvc_dataset_rel, f.name), "wb") as out_f:
+                            out_f.write(f.getbuffer())
+
+                    status_text.markdown(f"### ⏳ 步驟 1/4：處理音頻切片 (目標採樣率: {preprocess_sr} Hz)...")
+                    if run_and_stream([rvc_python, script_preprocess, rvc_dataset_rel, preprocess_sr, "8", rvc_logs_rel, "False", "3.0"], RVC_FULL_DIR, log_box) != 0: 
+                        raise Exception("音頻切片失敗")
+                    
+                    status_text.markdown("### ⏳ 步驟 2/4：提取神經網路特徵 (Hubert & RMVPE)...")
+                    if run_and_stream([rvc_python, script_extract_f0, rvc_logs_rel, "8", "rmvpe"], RVC_FULL_DIR, log_box) != 0: 
+                        raise Exception("F0提取失敗")
+                    if run_and_stream([rvc_python, script_extract_feat, "cuda:0", "1", "0", "0", rvc_logs_rel, "v2", "True"], RVC_FULL_DIR, log_box) != 0: 
+                        raise Exception("特徵提取失敗")
+                    
+                    # 生成 filelist.txt
+                    gt_wavs_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "0_gt_wavs")
+                    feature_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "3_feature768")
+                    f0_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "2a_f0")
+                    f0nsf_dir = os.path.join(RVC_FULL_DIR, rvc_logs_rel, "2b-f0nsf")
+                    
+                    names = set(name.split(".")[0] for name in os.listdir(gt_wavs_dir)) & \
+                            set(name.split(".")[0] for name in os.listdir(feature_dir)) & \
+                            set(name.split(".")[0] for name in os.listdir(f0_dir)) & \
+                            set(name.split(".")[0] for name in os.listdir(f0nsf_dir))
+                    
+                    opt_lines = [f"logs/{new_model_name}/0_gt_wavs/{name}.wav|logs/{new_model_name}/3_feature768/{name}.npy|logs/{new_model_name}/2a_f0/{name}.wav.npy|logs/{new_model_name}/2b-f0nsf/{name}.wav.npy|0" for name in sorted(list(names))]
+                    with open(os.path.join(RVC_FULL_DIR, rvc_logs_rel, "filelist.txt"), "w", encoding="utf-8") as f:
+                        f.write("\n".join(opt_lines))
+                    
+                    import json
+                    with open(config_template_path, "r", encoding="utf-8") as f: 
+                        config_data = json.load(f)
+                        
+                    config_data["train"]["batch_size"] = 16 # 稍微調降 batch size 確保 VRAM 安全
+                    config_data["train"]["total_epoch"] = total_epochs
+                    config_data["data"]["exp_dir"] = rvc_logs_rel
+                    config_data["data"]["training_files"] = f"./logs/{new_model_name}/filelist.txt"
+                    
+                    with open(os.path.join(RVC_FULL_DIR, rvc_logs_rel, "config.json"), "w", encoding="utf-8") as f:
+                        json.dump(config_data, f, indent=4, ensure_ascii=False)
+
+                # ==========================================
+                # 核心訓練 (全新與續訓共用)
+                # ==========================================
+                step_str = "3/4" if not is_resuming else "1/2"
+                status_text.markdown(f"### 🔥 步驟 {step_str}：模型高強度訓練中 (目標 Epoch: {total_epochs})...")
                 cmd_train = [
                     rvc_python, script_train, 
                     "-e", new_model_name, 
                     "-sr", chosen_sample_rate,
                     "-f0", "1", 
-                    "-bs", "8", 
+                    "-bs", "16", 
                     "-g", "0", 
                     "-te", str(total_epochs), 
-                    "-se", "50", 
+                    "-se", str(save_freq), # 🚀 將存檔頻率綁定到這裡
                     "-v", "v2", 
-                    "-l", "0", 
-                    "-c", "1"
+                    "-l", "0", # 🚀 0 代表「保留」所有中途存檔，不要只留最後一個
+                    "-c", "0"
                 ]
                 if run_and_stream(cmd_train, RVC_FULL_DIR, log_box) != 0: 
-                    raise Exception("模型訓練本體失敗")
+                    raise Exception("模型訓練本體失敗 (可能是 VRAM 爆滿或檔案遺失)")
                 
+                # ==========================================
+                # 🚀 關鍵修復：動態生成獨立的 Index 編譯腳本 (絕對路徑修正)
+                # ==========================================
+                step_str_idx = "4/4" if not is_resuming else "2/2"
+                status_text.markdown(f"### 🔍 步驟 {step_str_idx}：構建特徵檢索索引 (Index) 防止電音...")
+                
+                feat_dir = os.path.abspath(os.path.join(RVC_FULL_DIR, rvc_logs_rel, "3_feature768"))
+                index_out = os.path.abspath(os.path.join(RVC_FULL_DIR, rvc_logs_rel, f"added_{new_model_name}_v2.index"))
+                
+                # 【修正】：將腳本直接寫入 RVC 的 logs 資料夾內，並強制獲取絕對路徑
+                build_index_script = os.path.abspath(os.path.join(RVC_FULL_DIR, rvc_logs_rel, "build_index.py"))
+                
+                with open(build_index_script, "w", encoding="utf-8") as f:
+                    f.write("""import sys, numpy as np, faiss
+from pathlib import Path
+feat_dir, out_index = sys.argv[1], sys.argv[2]
+feats = [np.load(f) for f in Path(feat_dir).glob("*.npy")]
+if not feats:
+    print("No features found in 3_feature768!")
+    sys.exit(1)
+feats = np.concatenate(feats, axis=0)
+# 直接使用 FlatL2 窮舉演算法，鎖死音準
+index = faiss.IndexFlatL2(feats.shape[1])
+index.add(feats)
+faiss.write_index(index, out_index)
+print(f"Index successfully saved to {out_index}")
+""")
+
+                # 調用剛寫入的腳本來產生 .index 檔
+                cmd_index = [rvc_python, build_index_script, feat_dir, index_out]
+                if run_and_stream(cmd_index, RVC_FULL_DIR, log_box) != 0:
+                    st.warning("⚠️ 模型訓練成功，但 Index 索引建立失敗。這可能會導致推理時發生電音。")
+                else:
+                    # 💡 訓練成功後，順便把 Index 複製到推理區
+                    index_infer_dst = os.path.join(CURRENT_PROJECT_DIR, "rvc_engine", "logs", new_model_name)
+                    os.makedirs(index_infer_dst, exist_ok=True)
+                    shutil.copy(index_out, os.path.join(index_infer_dst, os.path.basename(index_out)))
+                
+                # 訓練結束後的檔案複製與清理
                 trained_model_src = os.path.join(RVC_FULL_DIR, "assets", "weights", f"{new_model_name}.pth")
                 infer_model_dst = os.path.join(CURRENT_PROJECT_DIR, "rvc_engine", "assets", "weights", f"{new_model_name}.pth")
                 
                 st.session_state.is_training = False 
+                st.session_state.is_resuming = False
+                
                 if os.path.exists(trained_model_src):
+                    # 同步複製到 inference 資料夾 (如果有設的話)
                     os.makedirs(os.path.dirname(infer_model_dst), exist_ok=True)
                     shutil.copy(trained_model_src, infer_model_dst)
-                    st.success(f"🎉 專屬模型 `{new_model_name}.pth` 已煉製完成！")
+                    
+                    st.success(f"🎉 專屬模型 `{new_model_name}` 訓練與 Index 構建已全數完成！")
+                    st.info(f"💡 系統已依照你的設定，每 {save_freq} 輪保留了一份權重檔。你可以在 Tab 1 的下拉選單中找到如 `{new_model_name}_e{save_freq}_s...pth` 等檔案進行試聽。")
                     st.balloons()
+                else:
+                    st.error("訓練流程結束，但找不到最終的 `.pth` 權重檔，請檢查終端機紅字報錯。")
+                    
             except Exception as e:
                 st.session_state.is_training = False 
-                st.error(f"❌ 發生致命錯誤：{str(e)}")
+                st.session_state.is_resuming = False
+                st.error(f"❌ 發生錯誤：{str(e)}")
                 st.button("確認並解除鎖定")
 
 # ==========================================
@@ -998,7 +1224,8 @@ with tab4:
             if images_dict:
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                    for img_name, img_bytes in images_dict.items(): zip_file.writestr(img_name, img_bytes)
+                    # 加上 _ = 防止 writestr 回傳的 None 跑出來
+                    for img_name, img_bytes in images_dict.items(): _ = zip_file.writestr(img_name, img_bytes)
                 
                 st.markdown("---")
                 st.download_button(
